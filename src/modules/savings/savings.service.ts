@@ -162,8 +162,7 @@ export class SavingsService {
       }
     })
 
-    // Ordenar de menor a mayor por días restantes (los más urgentes/vencidos arriba)
-    results.sort((a, b) => a.daysRemaining - b.daysRemaining)
+    results.sort((a, b) => b.id - a.id)
 
     return results
   }

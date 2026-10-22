@@ -1,4 +1,4 @@
-import { RowDataPacket } from 'mysql2'
+import { ResultSetHeader, RowDataPacket } from 'mysql2'
 import { dbPool } from '../../shared/config/database'
 
 export interface CreateLoanDTO {
@@ -41,13 +41,13 @@ export class LoansService {
       JOIN \`users\` u ON l.\`registeredBy\` = u.\`id\`
       LEFT JOIN \`payments\` pay ON l.\`id\` = pay.\`loanId\`
       GROUP BY l.\`id\`
-      ORDER BY l.\`status\` ASC, l.\`dueDate\` ASC
+      ORDER BY l.\`id\` DESC
     `
     const [rows] = await dbPool.execute<RowDataPacket[]>(query)
     return rows
   }
 
-  async createLoan(data: CreateLoanDTO): Promise<void> {
+  async createLoan(data: CreateLoanDTO): Promise<number> {
     const query = `
       INSERT INTO \`loans\` (
         \`partnerId\`, \`initialCapital\`, \`interestRate\`, \`deliveryMethod\`, 
@@ -55,14 +55,15 @@ export class LoansService {
         \`observations\`, \`registeredBy\`
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `
-    await dbPool.execute(query, [
+    const [result] = await dbPool.execute<ResultSetHeader>(query, [
       data.partnerId, data.initialCapital, data.interestRate, data.deliveryMethod,
       data.guarantee, data.deliveryDate, data.termDays, data.dueDate, 
       data.installments || 1, data.observations || '', data.registeredBy
     ])
+    return result.insertId
   }
 
-  async registerMixedPayment(loanId: number, data: LoanPaymentDTO): Promise<void> {
+  async registerMixedPayment(loanId: number, data: LoanPaymentDTO): Promise<number[]> {
     const connection = await dbPool.getConnection()
     try {
       await connection.beginTransaction()
@@ -79,14 +80,22 @@ export class LoansService {
       if (loanRows.length === 0) throw new Error('Préstamo no encontrado.')
       const partnerId = loanRows[0].partnerId
 
-      const inserts = []
+      const paymentIds: number[] = []
+      const payments = [
+        [data.capitalEfectivo, 'Abono Capital Préstamo', 'efectivo'],
+        [data.capitalTransferencia, 'Abono Capital Préstamo', 'transferencia'],
+        [data.interesEfectivo, 'Abono Interés Préstamo', 'efectivo'],
+        [data.interesTransferencia, 'Abono Interés Préstamo', 'transferencia']
+      ] as const
 
-      if (data.capitalEfectivo > 0) inserts.push(connection.execute(insertPaymentQuery, [partnerId, data.registeredBy, data.capitalEfectivo, 'Abono Capital Préstamo', 'efectivo', data.paymentDate, data.observations, loanId]))
-      if (data.capitalTransferencia > 0) inserts.push(connection.execute(insertPaymentQuery, [partnerId, data.registeredBy, data.capitalTransferencia, 'Abono Capital Préstamo', 'transferencia', data.paymentDate, data.observations, loanId]))
-      if (data.interesEfectivo > 0) inserts.push(connection.execute(insertPaymentQuery, [partnerId, data.registeredBy, data.interesEfectivo, 'Abono Interés Préstamo', 'efectivo', data.paymentDate, data.observations, loanId]))
-      if (data.interesTransferencia > 0) inserts.push(connection.execute(insertPaymentQuery, [partnerId, data.registeredBy, data.interesTransferencia, 'Abono Interés Préstamo', 'transferencia', data.paymentDate, data.observations, loanId]))
-
-      await Promise.all(inserts)
+      for (const [amount, concept, paymentMethod] of payments) {
+        if (amount <= 0) continue
+        const [result] = await connection.execute<ResultSetHeader>(insertPaymentQuery, [
+          partnerId, data.registeredBy, amount, concept, paymentMethod,
+          data.paymentDate, data.observations, loanId
+        ])
+        paymentIds.push(result.insertId)
+      }
 
       const [sumRows]: any = await connection.execute(
         `SELECT SUM(\`amount\`) AS totalCapitalPaid FROM \`payments\` WHERE \`loanId\` = ? AND \`concept\` = 'Abono Capital Préstamo'`, 
@@ -99,6 +108,7 @@ export class LoansService {
       }
 
       await connection.commit()
+      return paymentIds
     } catch (error) {
       await connection.rollback()
       throw error

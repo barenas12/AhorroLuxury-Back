@@ -1,4 +1,5 @@
 import { RowDataPacket } from 'mysql2'
+import { ResultSetHeader } from 'mysql2'
 import { dbPool } from '../../shared/config/database'
 
 export interface PaymentRowItemDTO {
@@ -66,7 +67,7 @@ export class PaymentsService {
   }
 
   // 3. Crear pagos asociando el ticketNumber si existe
-  async createMultiplePayments(data: CreateMultiplePaymentsDTO): Promise<void> {
+  async createMultiplePayments(data: CreateMultiplePaymentsDTO): Promise<number[]> {
     if (!data.items || data.items.length === 0) {
       throw new Error('Debe ingresar al menos un concepto de pago.')
     }
@@ -74,6 +75,7 @@ export class PaymentsService {
     const connection = await dbPool.getConnection()
     try {
       await connection.beginTransaction()
+      const paymentIds: number[] = []
 
       for (const item of data.items) {
         const hasFineFlag = item.hasFine ? 1 : 0
@@ -86,7 +88,7 @@ export class PaymentsService {
             \`paymentMethod\`, \`hasFine\`, \`fineAmount\`, \`paymentDate\`, \`observations\`
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `
-        await connection.execute(query, [
+        const [result] = await connection.execute<ResultSetHeader>(query, [
           data.partnerId,
           data.registeredBy,
           item.amount,
@@ -98,9 +100,11 @@ export class PaymentsService {
           item.paymentDate,
           item.observations ? item.observations.trim() : null
         ])
+        paymentIds.push(result.insertId)
       }
 
       await connection.commit()
+      return paymentIds
     } catch (error) {
       await connection.rollback()
       throw error

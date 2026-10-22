@@ -15,8 +15,8 @@ export class LoansController {
 
   async create(req: Request, res: Response): Promise<void> {
     try {
-      await loansService.createLoan(req.body)
-      res.status(201).json({ success: true, message: 'Préstamo registrado exitosamente.' })
+      const id = await loansService.createLoan(req.body)
+      res.status(201).json({ success: true, id, message: 'Préstamo registrado exitosamente.' })
     } catch (error: any) {
       res.status(400).json({ success: false, message: error.message })
     }
@@ -25,8 +25,8 @@ export class LoansController {
   async registerPayment(req: Request, res: Response): Promise<void> {
     try {
       const loanId = Number(req.params.id)
-      await loansService.registerMixedPayment(loanId, req.body)
-      res.status(200).json({ success: true, message: 'Pago de préstamo registrado correctamente.' })
+      const paymentIds = await loansService.registerMixedPayment(loanId, req.body)
+      res.status(200).json({ success: true, paymentIds, message: 'Pago de préstamo registrado correctamente.' })
     } catch (error: any) {
       res.status(400).json({ success: false, message: error.message })
     }

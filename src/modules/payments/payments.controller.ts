@@ -24,8 +24,8 @@ export class PaymentsController {
 
   async create(req: Request, res: Response): Promise<void> {
     try {
-      await paymentsService.createMultiplePayments(req.body)
-      res.status(201).json({ success: true, message: 'Abonos registrados exitosamente.' })
+      const paymentIds = await paymentsService.createMultiplePayments(req.body)
+      res.status(201).json({ success: true, paymentIds, message: 'Abonos registrados exitosamente.' })
     } catch (error: any) {
       res.status(400).json({ success: false, message: error.message })
     }
