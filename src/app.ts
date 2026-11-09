@@ -20,5 +20,11 @@ app.use('/api/savings', savingsRoutes)
 app.use('/api/loans', loansRoutes)
 app.use('/api/dashboard', dashboardRoutes)
 app.use('/api/egresses', egressesRoutes)
+app.get('/', (req, res) => {
+  res.json({
+    status: 'ok',
+    message: 'Backend de Ahorro Luxury corriendo correctamente en Vercel'
+  });
+});
 
 export default app
