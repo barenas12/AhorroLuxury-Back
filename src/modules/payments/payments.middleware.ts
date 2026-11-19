@@ -1,12 +1,12 @@
 import { Request, Response, NextFunction } from 'express'
 
 export const validatePayment = (req: Request, res: Response, next: NextFunction): void => {
-  const { partnerId, registeredBy, items } = req.body
+  const { partnerId, externalTicketId, registeredBy, items } = req.body
 
-  if (!partnerId || !registeredBy) {
+  if (!registeredBy) {
     res.status(400).json({
       success: false,
-      message: 'El socio y el usuario registrador son requeridos.'
+      message: 'El usuario registrador es requerido.'
     })
     return
   }
@@ -15,6 +15,15 @@ export const validatePayment = (req: Request, res: Response, next: NextFunction)
     res.status(400).json({
       success: false,
       message: 'Debe ingresar al menos una fila de abono.'
+    })
+    return
+  }
+
+  const hasAnyExternalItem = items.some((it: any) => Boolean(it.externalTicketId))
+  if (!partnerId && !externalTicketId && !hasAnyExternalItem) {
+    res.status(400).json({
+      success: false,
+      message: 'Debe seleccionar un socio o un comprador externo de boleta.'
     })
     return
   }
@@ -28,10 +37,22 @@ export const validatePayment = (req: Request, res: Response, next: NextFunction)
       return
     }
 
-    if (isNaN(Number(it.amount)) || Number(it.amount) <= 0) {
+    const amount = Number(it.amount || 0)
+    const fineAmount = it.hasFine ? Number(it.fineAmount || 0) : 0
+
+    if (isNaN(amount) || amount < 0 || isNaN(fineAmount) || fineAmount < 0) {
       res.status(400).json({
         success: false,
-        message: `El concepto "${it.concept}" debe tener un valor mayor a cero.`
+        message: `El concepto "${it.concept}" contiene valores inválidos.`
+      })
+      return
+    }
+
+    // Permite abono = $0 siempre que exista una multa > $0 (ej. $0 abono + $50.000 multa)
+    if (amount + fineAmount <= 0) {
+      res.status(400).json({
+        success: false,
+        message: `El concepto "${it.concept}" debe tener un monto de abono o multa mayor a $0.`
       })
       return
     }

@@ -7,9 +7,9 @@ const controller = new LoansController()
 const middleware = new LoansMiddleware()
 
 router.get('/', (req, res) => controller.list(req, res))
-
-// Se añade el middleware antes de ejecutar la función del controlador
+router.get('/:id/receipts', (req, res) => controller.getLoanReceipts(req, res))
 router.post('/', middleware.validateCreate, (req, res) => controller.create(req, res))
 router.post('/:id/pay', middleware.validatePayment, (req, res) => controller.registerPayment(req, res))
+router.patch('/:id/interest', (req, res) => controller.updateInterest(req, res))
 
 export default router

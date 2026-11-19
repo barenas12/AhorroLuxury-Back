@@ -9,7 +9,7 @@ export const dbPool: Pool = mysql.createPool({
   port: Number(process.env.DB_PORT) || 3306,
   user: process.env.DB_USER || 'root',
   password: process.env.DB_PASSWORD || '',
-  database: process.env.DB_NAME || 'ahorro_luxury_db',
+  database: process.env.DB_NAME || 'luxury',
   waitForConnections: true,
   connectionLimit: 10,        // Máximo 10 conexiones simultáneas
   maxIdle: 10,               // Conexiones inactivas permitidas

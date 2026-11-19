@@ -10,7 +10,18 @@ import egressesRoutes from './modules/egresses/egresses.routes'
 
 const app: Application = express()
 
-app.use(cors({ origin: 'http://localhost:5173', credentials: true }))
+app.use(
+  cors({
+    origin: [
+      'http://localhost:5173',
+      'http://127.0.0.1:5173',
+      'http://localhost:8081',
+      'http://127.0.0.1:8081',
+      'https://ahorro-luxury-web-one.vercel.app'
+    ],
+    credentials: true
+  })
+)
 app.use(express.json())
 
 app.use('/api/login', loginRoutes)
@@ -23,7 +34,7 @@ app.use('/api/egresses', egressesRoutes)
 app.get('/', (req, res) => {
   res.json({
     status: 'ok',
-    message: 'Backend de Ahorro Luxury corriendo correctamente en Vercel'
+    message: 'Backend de Ahorro Luxury corriendo localmente'
   });
 });
 

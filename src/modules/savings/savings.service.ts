@@ -1,25 +1,46 @@
 import { RowDataPacket } from 'mysql2'
 import { dbPool } from '../../shared/config/database'
+import {
+  addDaysUTC,
+  calculateQuotaByFrequency,
+  diffDaysUTC,
+  formatDateOnly,
+  formatOverdueDuration,
+  getTodayUTC,
+  parseDateOnlyUTC
+} from '../../shared/utils/date.utils'
+
+export interface TicketStatusItem {
+  number: string
+  raffle: 'Rifa 1' | 'Rifa 2'
+  raffleType: 1 | 2
+  isPaid: boolean
+  status: 'Al día' | 'En mora'
+}
 
 export interface PartnerSavingsStatus {
   id: number
   documentId: string
   fullName: string
-  cellphone: number
+  cellphone: string
   coordinatorName: string
   frequency: number
   savingsValue: number
+  quotaValue: number
+  savingsStartDate: string | null
+  savingsUpToDateAt: string | null
   totalSavedCurrentPeriod: number
-  overdueAmount: number // 👈 Valor exacto en mora
+  overdueAmount: number
   savingsStatus: 'Al día' | 'En mora'
-  nextDueDate: string
-  daysRemaining: number
-  ticketsStatus: {
-    number: string
-    raffle: string
-    isPaid: boolean
-    status: 'Al día' | 'En mora'
-  }[]
+  overdueTotalDays: number
+  overdueMonths: number
+  overdueDays: number
+  overdueLabel: string
+  ticketsRifa1: TicketStatusItem[]
+  ticketsRifa2: TicketStatusItem[]
+  rifa1Status: 'Al día' | 'En mora' | 'Sin boletas'
+  rifa2Status: 'Al día' | 'En mora' | 'Sin boletas'
+  ticketsStatus: TicketStatusItem[]
   generalTicketStatus: 'Al día' | 'En mora'
 }
 
@@ -34,129 +55,194 @@ export class SavingsService {
         p.\`cellphone\`,
         p.\`frequency\`,
         p.\`savingsValue\`,
+        DATE_FORMAT(p.\`savingsStartDate\`, '%Y-%m-%d') AS \`savingsStartDate\`,
+        DATE_FORMAT(p.\`savingsUpToDateAt\`, '%Y-%m-%d') AS \`savingsUpToDateAt\`,
+        p.\`statusValue\`,
         p.\`ticket\`,
         p.\`ticket2\`,
         COALESCE(CONCAT_WS(' ', coord.\`name\`, coord.\`lastName\`), 'Sin asignar') AS \`coordinatorName\`
       FROM \`partners\` p
       LEFT JOIN \`users\` coord ON p.\`coordinator\` = coord.\`id\`
-      WHERE p.\`status\` = 1
+      WHERE COALESCE(p.\`status\`, 1) = 1
     `
     const [partners] = await dbPool.execute<RowDataPacket[]>(partnersQuery)
 
-    // 2. Obtener pagos
+    // 2. Obtener pagos de socios
     const paymentsQuery = `
       SELECT 
         \`partnerId\`,
         \`amount\`,
         \`concept\`,
         \`ticketNumber\`,
-        \`paymentDate\`
+        \`raffleType\`,
+        DATE_FORMAT(\`paymentDate\`, '%Y-%m-%d') AS \`paymentDate\`
       FROM \`payments\`
+      WHERE \`partnerId\` IS NOT NULL
     `
     const [payments] = await dbPool.execute<RowDataPacket[]>(paymentsQuery)
 
     const parseTicketsArray = (raw: string | undefined): string[] => {
       if (!raw) return []
       try {
-        return JSON.parse(raw)
+        const parsed = JSON.parse(raw)
+        if (Array.isArray(parsed)) return parsed.map((t) => String(t).trim().padStart(2, '0')).filter(Boolean)
+        return []
       } catch {
-        return raw.split(',').map((t) => t.trim()).filter(Boolean)
+        return raw.split(',').map((t) => t.trim().padStart(2, '0')).filter(Boolean)
       }
     }
 
-    const today = new Date()
+    const today = getTodayUTC()
 
     const results: PartnerSavingsStatus[] = partners.map((p) => {
-      const partnerPayments = payments.filter((pay) => pay.partnerId === p.id)
-      const freq = Number(p.frequency) || 15
+      const partnerPayments = payments.filter((pay) => Number(pay.partnerId) === Number(p.id))
+      const freq = Number(p.frequency) || 30
       const totalMonthlySavings = Number(p.savingsValue) || 0
+      const quotaValue = calculateQuotaByFrequency(totalMonthlySavings, freq)
 
-      // Cuota teórica según frecuencia
-      let expectedQuota = totalMonthlySavings
-      if (freq === 15) expectedQuota = Math.round(totalMonthlySavings / 2)
-      else if (freq === 8) expectedQuota = Math.round(totalMonthlySavings / 4)
-
-      // 1. Solo sumar el valor neto del abono (amount). La multa NO se suma al ahorro
+      // Solo sumar el valor neto del abono (amount). La multa NO se suma al ahorro
       const savingsPayments = partnerPayments.filter((pay) => pay.concept === 'Abono Ahorro')
-      const totalSaved = savingsPayments.reduce((acc, pay) => acc + Number(pay.amount), 0)
+      const totalSaved = savingsPayments.reduce((acc, pay) => acc + Number(pay.amount || 0), 0)
 
-      // Cálculo de fecha de vencimiento
-      let lastDate = new Date()
-      if (savingsPayments.length > 0) {
-        const sorted = [...savingsPayments].sort(
-          (a, b) => new Date(b.paymentDate).getTime() - new Date(a.paymentDate).getTime()
-        )
-        const first = sorted[0]
-        if (first) {
-          lastDate = new Date(first.paymentDate)
+      const startDateStr = formatDateOnly(p.savingsStartDate)
+      const upToDateStr = formatDateOnly(p.savingsUpToDateAt)
+
+      let overdueAmount = 0
+      let overdueTotalDays = 0
+      let savingsStatus: 'Al día' | 'En mora' = 'Al día'
+
+      if (upToDateStr) {
+        const baselineDate = parseDateOnlyUTC(upToDateStr)!
+        const daysElapsed = diffDaysUTC(today, baselineDate)
+
+        if (daysElapsed >= freq) {
+          const savedAfterBaseline = savingsPayments
+            .filter((pay) => {
+              const pd = formatDateOnly(pay.paymentDate)
+              return pd !== null && pd > upToDateStr
+            })
+            .reduce((acc, pay) => acc + Number(pay.amount || 0), 0)
+
+          const periodsDue = Math.floor(daysElapsed / freq)
+          const expectedSinceBaseline = periodsDue * quotaValue
+          overdueAmount = Math.max(0, expectedSinceBaseline - savedAfterBaseline)
+
+          if (overdueAmount > 0) {
+            savingsStatus = 'En mora'
+            const coveredPeriods = quotaValue > 0 ? Math.floor(savedAfterBaseline / quotaValue) : 0
+            const paidThroughDate = addDaysUTC(baselineDate, coveredPeriods * freq)
+            overdueTotalDays = Math.max(0, diffDaysUTC(today, paidThroughDate))
+          }
+        }
+      } else {
+        // Sin fecha de "Al día": usar savingsStartDate o la fecha del primer abono de ahorro
+        let baselineDate = parseDateOnlyUTC(startDateStr)
+        if (!baselineDate && savingsPayments.length > 0) {
+          const earliest = [...savingsPayments]
+            .map((pay) => parseDateOnlyUTC(pay.paymentDate))
+            .filter((d): d is Date => d !== null)
+            .sort((a, b) => a.getTime() - b.getTime())[0]
+          baselineDate = earliest || null
+        }
+
+        if (baselineDate) {
+          const daysElapsed = diffDaysUTC(today, baselineDate)
+          if (daysElapsed >= freq) {
+            const periodsDue = Math.floor(daysElapsed / freq)
+            const expectedTotal = periodsDue * quotaValue
+            overdueAmount = Math.max(0, expectedTotal - totalSaved)
+
+            if (overdueAmount > 0) {
+              savingsStatus = 'En mora'
+              const coveredPeriods = quotaValue > 0 ? Math.floor(totalSaved / quotaValue) : 0
+              const paidThroughDate = addDaysUTC(baselineDate, coveredPeriods * freq)
+              overdueTotalDays = Math.max(0, diffDaysUTC(today, paidThroughDate))
+            }
+          }
         }
       }
 
-      const nextDue = new Date(lastDate)
-      nextDue.setDate(nextDue.getDate() + freq)
+      const overdueInfo = formatOverdueDuration(overdueTotalDays)
 
-      const diffTime = nextDue.getTime() - today.getTime()
-      const daysRemaining = Math.ceil(diffTime / (1000 * 60 * 60 * 24))
+      // Boletas pagadas separadas por Rifa 1 y Rifa 2
+      const ticketPayments = partnerPayments.filter(
+        (pay) => pay.concept === 'Pago Boleta' && pay.ticketNumber
+      )
 
-      // 2. Cálculo del Valor en Mora
-      let overdueAmount = 0
-      let savingsStatus: 'Al día' | 'En mora' = 'Al día'
-
-      if (totalSaved < expectedQuota || daysRemaining < 0) {
-        savingsStatus = 'En mora'
-        overdueAmount = Math.max(0, expectedQuota - totalSaved)
-      } else {
-        savingsStatus = 'Al día'
-        overdueAmount = 0
+      const isTicketPaid = (ticketNum: string, raffleType: 1 | 2): boolean => {
+        return ticketPayments.some(
+          (pay) =>
+            String(pay.ticketNumber).trim().padStart(2, '0') === ticketNum &&
+            (Number(pay.raffleType) === raffleType || pay.raffleType === null)
+        )
       }
-
-      // Boletas pagadas
-      const paidTicketNumbers = partnerPayments
-        .filter((pay) => pay.concept === 'Pago Boleta' && pay.ticketNumber)
-        .map((pay) => pay.ticketNumber)
 
       const tickets1 = parseTicketsArray(p.ticket)
       const tickets2 = parseTicketsArray(p.ticket2)
 
-      const ticketsStatus: any[] = []
-
-      tickets1.forEach((t) => {
-        const isPaid = paidTicketNumbers.includes(t)
-        ticketsStatus.push({
+      const ticketsRifa1: TicketStatusItem[] = tickets1.map((t) => {
+        const isPaid = isTicketPaid(t, 1)
+        return {
           number: t,
           raffle: 'Rifa 1',
+          raffleType: 1,
           isPaid,
           status: isPaid ? 'Al día' : 'En mora'
-        })
+        }
       })
 
-      tickets2.forEach((t) => {
-        const isPaid = paidTicketNumbers.includes(t)
-        ticketsStatus.push({
+      const ticketsRifa2: TicketStatusItem[] = tickets2.map((t) => {
+        const isPaid = isTicketPaid(t, 2)
+        return {
           number: t,
           raffle: 'Rifa 2',
+          raffleType: 2,
           isPaid,
           status: isPaid ? 'Al día' : 'En mora'
-        })
+        }
       })
 
+      const rifa1Status: 'Al día' | 'En mora' | 'Sin boletas' =
+        ticketsRifa1.length === 0
+          ? 'Sin boletas'
+          : ticketsRifa1.some((t) => !t.isPaid)
+            ? 'En mora'
+            : 'Al día'
+
+      const rifa2Status: 'Al día' | 'En mora' | 'Sin boletas' =
+        ticketsRifa2.length === 0
+          ? 'Sin boletas'
+          : ticketsRifa2.some((t) => !t.isPaid)
+            ? 'En mora'
+            : 'Al día'
+
+      const ticketsStatus: TicketStatusItem[] = [...ticketsRifa1, ...ticketsRifa2]
       const hasUnpaidTickets = ticketsStatus.some((t) => !t.isPaid)
       const generalTicketStatus: 'Al día' | 'En mora' =
         ticketsStatus.length > 0 && hasUnpaidTickets ? 'En mora' : 'Al día'
 
       return {
-        id: p.id,
+        id: Number(p.id),
         documentId: p.documentId,
         fullName: p.fullName,
-        cellphone: p.cellphone,
+        cellphone: String(p.cellphone || ''),
         coordinatorName: p.coordinatorName,
         frequency: freq,
         savingsValue: totalMonthlySavings,
+        quotaValue,
+        savingsStartDate: startDateStr,
+        savingsUpToDateAt: upToDateStr,
         totalSavedCurrentPeriod: totalSaved,
-        overdueAmount, // 👈 Valor en mora calculado
+        overdueAmount,
         savingsStatus,
-        nextDueDate: nextDue.toISOString().substring(0, 10),
-        daysRemaining,
+        overdueTotalDays: overdueInfo.overdueTotalDays,
+        overdueMonths: overdueInfo.overdueMonths,
+        overdueDays: overdueInfo.overdueDays,
+        overdueLabel: overdueInfo.overdueLabel,
+        ticketsRifa1,
+        ticketsRifa2,
+        rifa1Status,
+        rifa2Status,
         ticketsStatus,
         generalTicketStatus
       }

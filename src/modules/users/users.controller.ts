@@ -37,7 +37,11 @@ export class UsersController {
 
   async update(req: Request, res: Response): Promise<void> {
     try {
-      await usersService.updateUser(req.body);
+      const payload = {
+        ...req.body,
+        id: Number(req.params.id || req.body.id),
+      };
+      await usersService.updateUser(payload);
       res
         .status(200)
         .json({ success: true, message: "Usuario actualizado exitosamente." });
@@ -50,12 +54,10 @@ export class UsersController {
     try {
       const { documentId, status } = req.body;
       await usersService.togglePartnerStatus(documentId, status);
-      res
-        .status(200)
-        .json({
-          success: true,
-          message: "Estado del ahorro en partners actualizado correctamente.",
-        });
+      res.status(200).json({
+        success: true,
+        message: "Estado del ahorro en partners actualizado correctamente.",
+      });
     } catch (error: any) {
       res.status(400).json({ success: false, message: error.message });
     }
@@ -63,14 +65,14 @@ export class UsersController {
 
   async resetPassword(req: Request, res: Response): Promise<void> {
     try {
-      const { documentId } = req.body;
+      const documentId = req.params.documentId || req.body?.documentId;
       if (!documentId) {
         res
           .status(400)
           .json({ success: false, message: "El documento es requerido." });
         return;
       }
-      await usersService.resetPassword(documentId);
+      await usersService.resetPassword(String(documentId));
       res.status(200).json({
         success: true,
         message:
@@ -100,6 +102,20 @@ export class UsersController {
       res.status(200).json({ success: true, data: board });
     } catch (error: any) {
       res.status(500).json({ success: false, message: error.message });
+    }
+  }
+
+  async assignRaffleTicket(req: Request, res: Response): Promise<void> {
+    try {
+      const type = req.params.type === "2" ? "2" : "1";
+      const result = await usersService.assignRaffleTicket(type, req.body);
+      res.status(201).json({
+        success: true,
+        data: result,
+        message: `Boleta #${result.ticketNumber} asignada exitosamente en Rifa ${type}.`,
+      });
+    } catch (error: any) {
+      res.status(400).json({ success: false, message: error.message });
     }
   }
 }

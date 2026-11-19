@@ -1,7 +1,7 @@
-
-import { RowDataPacket } from 'mysql2'
+import { ResultSetHeader, RowDataPacket } from 'mysql2'
 import bcrypt from 'bcrypt'
 import { dbPool } from '../../shared/config/database'
+import { calculateQuotaByFrequency, formatDateOnly } from '../../shared/utils/date.utils'
 
 export interface CreateUserDTO {
   documentId: string
@@ -9,7 +9,8 @@ export interface CreateUserDTO {
   lastName: string
   savingsValue: number
   frequency: number
-  cellphone: number
+  savingsStartDate?: string | null
+  cellphone: number | string
   coordinator: number
   profile: number
   canLogin: boolean
@@ -17,36 +18,36 @@ export interface CreateUserDTO {
   ticket2?: string[] | string
 }
 
-export interface UpdateUserDTO {
+export interface UpdateUserDTO extends CreateUserDTO {
   id: number
-  documentId: string
-  name: string
-  lastName: string
-  savingsValue: number
-  frequency: number
-  cellphone: number
-  coordinator: number
-  profile: number
-  canLogin: boolean
-  ticket?: string[] | string
-  ticket2?: string[] | string
+}
+
+export interface AssignRaffleTicketDTO {
+  ticketNumber: string
+  assigneeType: 'partner' | 'external'
+  partnerId?: number
+  fullName?: string
+  cellphone?: string | number
+  coordinatorId?: number
 }
 
 export class UsersService {
+  private parseTicketsSafe(raw: string | string[] | null | undefined): string[] {
+    if (!raw) return []
+    if (Array.isArray(raw)) return raw.map((t) => String(t).trim()).filter(Boolean)
+    try {
+      const parsed = JSON.parse(raw)
+      if (Array.isArray(parsed)) return parsed.map((t) => String(t).trim()).filter(Boolean)
+      return []
+    } catch {
+      return String(raw).split(',').map((t) => t.trim()).filter(Boolean)
+    }
+  }
+
   // Función auxiliar para normalizar y validar boletas (00 a 99)
   private normalizeAndValidateTickets(rawTickets: string[] | string | undefined, raffleLabel: string): string[] {
     if (!rawTickets) return []
-
-    let ticketsArray: string[] = []
-    if (typeof rawTickets === 'string') {
-      try {
-        ticketsArray = JSON.parse(rawTickets)
-      } catch {
-        ticketsArray = rawTickets.split(',').map((t) => t.trim())
-      }
-    } else if (Array.isArray(rawTickets)) {
-      ticketsArray = rawTickets
-    }
+    const ticketsArray = this.parseTicketsSafe(rawTickets)
 
     const cleaned: string[] = []
     for (const item of ticketsArray) {
@@ -62,19 +63,28 @@ export class UsersService {
       cleaned.push(formatted)
     }
 
+    cleaned.sort((a, b) => parseInt(a, 10) - parseInt(b, 10))
     return cleaned
   }
 
-  // Valida que los números no estén tomados por otro socio en la columna específica
+  // Valida que los números no estén tomados por otro socio activo ni por compradores externos
   private async checkTicketsAvailability(
-    tickets: string[], 
-    columnName: 'ticket' | 'ticket2', 
-    raffleName: string, 
+    tickets: string[],
+    columnName: 'ticket' | 'ticket2',
+    raffleName: string,
     excludePartnerId?: number
   ): Promise<void> {
     if (tickets.length === 0) return
 
-    let query = `SELECT \`id\`, \`name\`, \`lastName\`, \`${columnName}\` AS \`ticketsField\` FROM \`partners\` WHERE \`${columnName}\` IS NOT NULL AND \`${columnName}\` != ''`
+    const raffleType = columnName === 'ticket2' ? 2 : 1
+
+    let query = `
+      SELECT \`id\`, \`name\`, \`lastName\`, \`${columnName}\` AS \`ticketsField\`
+      FROM \`partners\`
+      WHERE COALESCE(\`status\`, 1) = 1
+        AND \`${columnName}\` IS NOT NULL
+        AND \`${columnName}\` != ''
+    `
     const params: any[] = []
 
     if (excludePartnerId) {
@@ -85,23 +95,30 @@ export class UsersService {
     const [rows] = await dbPool.execute<RowDataPacket[]>(query, params)
 
     for (const row of rows) {
-      let existingTickets: string[] = []
-      try {
-        existingTickets = JSON.parse(row.ticketsField)
-      } catch {
-        existingTickets = typeof row.ticketsField === 'string' ? row.ticketsField.split(',') : []
-      }
-
+      const existingTickets = this.parseTicketsSafe(row.ticketsField)
       for (const t of tickets) {
         if (existingTickets.includes(t)) {
           throw new Error(`La boleta "${t}" en ${raffleName} ya está asignada a ${row.name} ${row.lastName}.`)
         }
       }
     }
+
+    // También validar contra boletas externas (compradas por afuera)
+    const [extRows] = await dbPool.execute<RowDataPacket[]>(
+      `SELECT \`ticketNumber\`, \`fullName\` FROM \`raffle_external_tickets\` WHERE \`raffleType\` = ?`,
+      [raffleType]
+    )
+
+    for (const ext of extRows) {
+      const formattedExt = String(ext.ticketNumber).padStart(2, '0')
+      if (tickets.includes(formattedExt)) {
+        throw new Error(`La boleta "${formattedExt}" en ${raffleName} ya está asignada a ${ext.fullName} (Externo).`)
+      }
+    }
   }
 
-  // 1. Obtener socios con ambos campos de boletas
-  async getAllUsers(partnerStatusFilter?: number): Promise<RowDataPacket[]> {
+  // 1. Obtener socios con ambos campos de boletas, fecha inicio y cuota calculada
+  async getAllUsers(partnerStatusFilter?: number): Promise<any[]> {
     let query = `
       SELECT 
         p.\`id\`,
@@ -111,6 +128,10 @@ export class UsersService {
         CONCAT_WS(' ', p.\`name\`, p.\`lastName\`) AS \`fullName\`,
         p.\`savingsValue\`,
         p.\`frequency\`,
+        DATE_FORMAT(p.\`savingsStartDate\`, '%Y-%m-%d') AS \`savingsStartDate\`,
+        DATE_FORMAT(p.\`savingsUpToDateAt\`, '%Y-%m-%d') AS \`savingsUpToDateAt\`,
+        p.\`statusValue\`,
+        p.\`statusTicket\`,
         p.\`cellphone\`,
         p.\`coordinator\`,
         p.\`ticket\`,
@@ -133,7 +154,11 @@ export class UsersService {
 
     query += ` ORDER BY p.\`id\` DESC `
     const [rows] = await dbPool.execute<RowDataPacket[]>(query, params)
-    return rows
+
+    return rows.map((row) => ({
+      ...row,
+      quotaValue: calculateQuotaByFrequency(Number(row.savingsValue || 0), Number(row.frequency || 30))
+    }))
   }
 
   // 2. Coordinadores
@@ -151,7 +176,7 @@ export class UsersService {
     return rows
   }
 
-  // 3. Crear usuario con ticket y ticket2 independientes
+  // 3. Crear usuario con ticket, ticket2 y savingsStartDate
   async createUser(data: CreateUserDTO): Promise<void> {
     const tickets1 = this.normalizeAndValidateTickets(data.ticket, 'Rifa 1')
     const tickets2 = this.normalizeAndValidateTickets(data.ticket2, 'Rifa 2')
@@ -161,6 +186,7 @@ export class UsersService {
 
     const ticketJson1 = JSON.stringify(tickets1)
     const ticketJson2 = JSON.stringify(tickets2)
+    const startDate = formatDateOnly(data.savingsStartDate)
 
     const connection = await dbPool.getConnection()
     try {
@@ -177,9 +203,9 @@ export class UsersService {
 
       const partnerQuery = `
         INSERT INTO \`partners\` (
-          \`documentId\`, \`name\`, \`lastName\`, \`savingsValue\`, \`frequency\`, \`cellphone\`, 
-          \`coordinator\`, \`ticket\`, \`ticket2\`, \`status\`
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+          \`documentId\`, \`name\`, \`lastName\`, \`savingsValue\`, \`frequency\`, \`savingsStartDate\`,
+          \`cellphone\`, \`coordinator\`, \`ticket\`, \`ticket2\`, \`statusValue\`, \`statusTicket\`, \`status\`
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Al día', 'Al día', 1)
       `
       await connection.execute(partnerQuery, [
         data.documentId.trim(),
@@ -187,7 +213,8 @@ export class UsersService {
         data.lastName.trim(),
         data.savingsValue,
         data.frequency,
-        data.cellphone,
+        startDate,
+        String(data.cellphone || ''),
         data.coordinator,
         ticketJson1,
         ticketJson2
@@ -220,8 +247,12 @@ export class UsersService {
     }
   }
 
-  // 4. Actualizar usuario con ticket y ticket2 independientes
+  // 4. Actualizar usuario con ticket, ticket2 y savingsStartDate
   async updateUser(data: UpdateUserDTO): Promise<void> {
+    if (!data.id || isNaN(Number(data.id))) {
+      throw new Error('ID de socio inválido.')
+    }
+
     const tickets1 = this.normalizeAndValidateTickets(data.ticket, 'Rifa 1')
     const tickets2 = this.normalizeAndValidateTickets(data.ticket2, 'Rifa 2')
 
@@ -230,6 +261,7 @@ export class UsersService {
 
     const ticketJson1 = JSON.stringify(tickets1)
     const ticketJson2 = JSON.stringify(tickets2)
+    const startDate = formatDateOnly(data.savingsStartDate)
 
     const connection = await dbPool.getConnection()
     try {
@@ -249,7 +281,7 @@ export class UsersService {
       const updatePartnerQuery = `
         UPDATE \`partners\`
         SET \`documentId\` = ?, \`name\` = ?, \`lastName\` = ?, \`savingsValue\` = ?, 
-            \`frequency\` = ?, \`cellphone\` = ?, \`coordinator\` = ?, \`ticket\` = ?, \`ticket2\` = ?
+            \`frequency\` = ?, \`savingsStartDate\` = ?, \`cellphone\` = ?, \`coordinator\` = ?, \`ticket\` = ?, \`ticket2\` = ?
         WHERE \`id\` = ?
       `
       await connection.execute(updatePartnerQuery, [
@@ -258,7 +290,8 @@ export class UsersService {
         data.lastName.trim(),
         data.savingsValue,
         data.frequency,
-        data.cellphone,
+        startDate,
+        String(data.cellphone || ''),
         data.coordinator,
         ticketJson1,
         ticketJson2,
@@ -289,20 +322,64 @@ export class UsersService {
     }
   }
 
-  // 5. Consulta de Cuadrícula de Rifa (00 al 99)
+  // 5. Consulta de Cuadrícula de Rifa (00 al 99) incluyendo socios, externos y estado de pago
   async getRaffleBoard(raffleType: '1' | '2'): Promise<any[]> {
-    const column = raffleType === '2' ? 'ticket2' : 'ticket'
-    const query = `
+    const raffleNum = raffleType === '2' ? 2 : 1
+    const column = raffleNum === 2 ? 'ticket2' : 'ticket'
+
+    const partnersQuery = `
       SELECT 
-        \`id\`, 
-        \`documentId\`, 
-        CONCAT_WS(' ', \`name\`, \`lastName\`) AS \`fullName\`,
-        \`cellphone\`,
-        \`${column}\` AS \`tickets\`
-      FROM \`partners\`
-      WHERE \`status\` = 1 AND \`${column}\` IS NOT NULL AND \`${column}\` != ''
+        p.\`id\`, 
+        p.\`documentId\`, 
+        CONCAT_WS(' ', p.\`name\`, p.\`lastName\`) AS \`fullName\`,
+        p.\`cellphone\`,
+        COALESCE(CONCAT_WS(' ', coord.\`name\`, coord.\`lastName\`), 'Sin asignar') AS \`coordinatorName\`,
+        p.\`${column}\` AS \`tickets\`
+      FROM \`partners\` p
+      LEFT JOIN \`users\` coord ON p.\`coordinator\` = coord.\`id\`
+      WHERE COALESCE(p.\`status\`, 1) = 1 AND p.\`${column}\` IS NOT NULL AND p.\`${column}\` != ''
     `
-    const [rows] = await dbPool.execute<RowDataPacket[]>(query)
+    const [partnerRows] = await dbPool.execute<RowDataPacket[]>(partnersQuery)
+
+    const externalQuery = `
+      SELECT
+        e.\`id\`,
+        e.\`ticketNumber\`,
+        e.\`fullName\`,
+        e.\`cellphone\`,
+        e.\`coordinatorId\`,
+        COALESCE(CONCAT_WS(' ', coord.\`name\`, coord.\`lastName\`), 'Sin asignar') AS \`coordinatorName\`
+      FROM \`raffle_external_tickets\` e
+      LEFT JOIN \`users\` coord ON e.\`coordinatorId\` = coord.\`id\`
+      WHERE e.\`raffleType\` = ?
+    `
+    const [externalRows] = await dbPool.execute<RowDataPacket[]>(externalQuery, [raffleNum])
+
+    const [paidRows] = await dbPool.execute<RowDataPacket[]>(
+      `
+        SELECT \`partnerId\`, \`externalTicketId\`, \`ticketNumber\`, \`raffleType\`
+        FROM \`payments\`
+        WHERE \`concept\` = 'Pago Boleta'
+          AND (\`raffleType\` = ? OR \`raffleType\` IS NULL)
+      `,
+      [raffleNum]
+    )
+
+    const isPartnerTicketPaid = (partnerId: number, ticketNum: string): boolean => {
+      return paidRows.some(
+        (pay) =>
+          Number(pay.partnerId) === partnerId &&
+          String(pay.ticketNumber || '').padStart(2, '0') === ticketNum
+      )
+    }
+
+    const isExternalTicketPaid = (externalTicketId: number, ticketNum: string): boolean => {
+      return paidRows.some(
+        (pay) =>
+          Number(pay.externalTicketId) === externalTicketId ||
+          (pay.externalTicketId && String(pay.ticketNumber || '').padStart(2, '0') === ticketNum && Number(pay.raffleType) === raffleNum)
+      )
+    }
 
     // Mapa de 00 al 99
     const board: any[] = []
@@ -311,33 +388,124 @@ export class UsersService {
       board.push({
         number: numStr,
         isAssigned: false,
+        assigneeType: null as 'partner' | 'external' | null,
+        isPaid: false,
+        paymentStatus: 'Disponible' as 'Disponible' | 'Al día' | 'En mora',
         partner: null
       })
     }
 
-    for (const row of rows) {
-      let partnerTickets: string[] = []
-      try {
-        partnerTickets = JSON.parse(row.tickets)
-      } catch {
-        partnerTickets = typeof row.tickets === 'string' ? row.tickets.split(',') : []
-      }
-
+    // Socios ahorradores
+    for (const row of partnerRows) {
+      const partnerTickets = this.parseTicketsSafe(row.tickets)
       for (const t of partnerTickets) {
         const index = parseInt(t, 10)
         if (index >= 0 && index <= 99 && board[index]) {
+          const numStr = index.toString().padStart(2, '0')
+          const isPaid = isPartnerTicketPaid(Number(row.id), numStr)
           board[index].isAssigned = true
+          board[index].assigneeType = 'partner'
+          board[index].isPaid = isPaid
+          board[index].paymentStatus = isPaid ? 'Al día' : 'En mora'
           board[index].partner = {
             id: row.id,
             documentId: row.documentId,
             fullName: row.fullName,
-            cellphone: row.cellphone
+            cellphone: row.cellphone,
+            coordinatorName: row.coordinatorName,
+            isExternal: false
           }
         }
       }
     }
 
+    // Compradores externos (por afuera)
+    for (const ext of externalRows) {
+      const index = parseInt(ext.ticketNumber, 10)
+      if (index >= 0 && index <= 99 && board[index]) {
+        const numStr = index.toString().padStart(2, '0')
+        const isPaid = isExternalTicketPaid(Number(ext.id), numStr)
+        board[index].isAssigned = true
+        board[index].assigneeType = 'external'
+        board[index].isPaid = isPaid
+        board[index].paymentStatus = isPaid ? 'Al día' : 'En mora'
+        board[index].partner = {
+          id: ext.id,
+          externalTicketId: ext.id,
+          documentId: 'Externo',
+          fullName: ext.fullName,
+          cellphone: ext.cellphone,
+          coordinatorId: ext.coordinatorId,
+          coordinatorName: ext.coordinatorName,
+          isExternal: true
+        }
+      }
+    }
+
     return board
+  }
+
+  // 6. Asignar boleta disponible desde la cuadrícula de rifas (a socio o comprador externo)
+  async assignRaffleTicket(raffleType: '1' | '2', data: AssignRaffleTicketDTO): Promise<{ ticketNumber: string; assigneeType: 'partner' | 'external'; id: number }> {
+    const raffleNum = raffleType === '2' ? 2 : 1
+    const columnName: 'ticket' | 'ticket2' = raffleNum === 2 ? 'ticket2' : 'ticket'
+    const raffleLabel = raffleNum === 2 ? 'Rifa 2' : 'Rifa 1'
+
+    const num = parseInt(String(data.ticketNumber || '').trim(), 10)
+    if (isNaN(num) || num < 0 || num > 99) {
+      throw new Error(`El número "${data.ticketNumber}" es inválido. Debe estar entre 00 y 99.`)
+    }
+    const formatted = num.toString().padStart(2, '0')
+
+    await this.checkTicketsAvailability([formatted], columnName, raffleLabel)
+
+    if (data.assigneeType === 'partner') {
+      const partnerId = Number(data.partnerId)
+      if (!partnerId) {
+        throw new Error('Debes seleccionar un socio activo para asignar la boleta.')
+      }
+
+      const [rows] = await dbPool.execute<RowDataPacket[]>(
+        `SELECT \`id\`, \`${columnName}\` AS \`ticketsField\` FROM \`partners\` WHERE \`id\` = ? AND COALESCE(\`status\`, 1) = 1 LIMIT 1`,
+        [partnerId]
+      )
+      if (rows.length === 0) {
+        throw new Error('Socio no encontrado o inactivo.')
+      }
+
+      const currentTickets = this.parseTicketsSafe(rows[0].ticketsField)
+      if (!currentTickets.includes(formatted)) {
+        currentTickets.push(formatted)
+        currentTickets.sort((a, b) => parseInt(a, 10) - parseInt(b, 10))
+      }
+
+      await dbPool.execute(
+        `UPDATE \`partners\` SET \`${columnName}\` = ? WHERE \`id\` = ?`,
+        [JSON.stringify(currentTickets), partnerId]
+      )
+
+      return { ticketNumber: formatted, assigneeType: 'partner', id: partnerId }
+    }
+
+    if (data.assigneeType === 'external') {
+      const fullName = String(data.fullName || '').trim()
+      const cellphone = String(data.cellphone || '').trim()
+      const coordinatorId = Number(data.coordinatorId)
+
+      if (!fullName || !cellphone || !coordinatorId) {
+        throw new Error('Nombre, celular y coordinador responsable son obligatorios para boletas externas.')
+      }
+
+      const [result] = await dbPool.execute<ResultSetHeader>(
+        `INSERT INTO \`raffle_external_tickets\` (\`raffleType\`, \`ticketNumber\`, \`fullName\`, \`cellphone\`, \`coordinatorId\`)
+         VALUES (?, ?, ?, ?, ?)`,
+        [raffleNum, formatted, fullName, cellphone, coordinatorId]
+      )
+
+      return { ticketNumber: formatted, assigneeType: 'external', id: result.insertId }
+    }
+
+    throw new Error('Tipo de asignación inválido.')
   }
 
   // Métodos de estado y reset...
@@ -362,5 +530,4 @@ export class UsersService {
       [hashedPassword, username.trim()]
     )
   }
-
 }
