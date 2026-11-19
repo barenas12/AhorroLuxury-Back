@@ -4,6 +4,8 @@ import dotenv from 'dotenv'
 dotenv.config()
 
 // 1. Configuración del Pool de conexiones
+const isLocal = !process.env.DB_HOST || process.env.DB_HOST === 'localhost' || process.env.DB_HOST === '127.0.0.1'
+
 export const dbPool: Pool = mysql.createPool({
   host: process.env.DB_HOST || 'localhost',
   port: Number(process.env.DB_PORT) || 3306,
@@ -16,7 +18,13 @@ export const dbPool: Pool = mysql.createPool({
   idleTimeout: 60000,        // Tiempo antes de cerrar conexión inactiva (ms)
   queueLimit: 0,             // Sin límite de peticiones en cola
   enableKeepAlive: true,
-  keepAliveInitialDelay: 0
+  keepAliveInitialDelay: 0,
+  ...(isLocal ? {} : {
+    ssl: {
+      minVersion: 'TLSv1.2',
+      rejectUnauthorized: true
+    }
+  })
 })
 
 // 2. Función para testear la conexión al levantar el backend
