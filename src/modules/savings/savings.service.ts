@@ -9,6 +9,7 @@ import {
   getTodayUTC,
   parseDateOnlyUTC
 } from '../../shared/utils/date.utils'
+import { ViewerScope } from '../../shared/utils/scope.utils'
 
 export interface TicketStatusItem {
   number: string
@@ -45,14 +46,15 @@ export interface PartnerSavingsStatus {
 }
 
 export class SavingsService {
-  async getSavingsDashboard(): Promise<PartnerSavingsStatus[]> {
-    // 1. Obtener socios activos
-    const partnersQuery = `
+  async getSavingsDashboard(scope?: ViewerScope): Promise<PartnerSavingsStatus[]> {
+    // 1. Obtener socios activos filtrados según el alcance del perfil
+    let partnersQuery = `
       SELECT 
         p.\`id\`,
         p.\`documentId\`,
         CONCAT_WS(' ', p.\`name\`, p.\`lastName\`) AS \`fullName\`,
         p.\`cellphone\`,
+        p.\`coordinator\`,
         p.\`frequency\`,
         p.\`savingsValue\`,
         DATE_FORMAT(p.\`savingsStartDate\`, '%Y-%m-%d') AS \`savingsStartDate\`,
@@ -65,7 +67,27 @@ export class SavingsService {
       LEFT JOIN \`users\` coord ON p.\`coordinator\` = coord.\`id\`
       WHERE COALESCE(p.\`status\`, 1) = 1
     `
-    const [partners] = await dbPool.execute<RowDataPacket[]>(partnersQuery)
+    const params: any[] = []
+
+    if (scope && scope.profile === 3) {
+      if (!scope.ownPartnerId) return []
+      partnersQuery += ` AND p.\`id\` = ? `
+      params.push(scope.ownPartnerId)
+    } else if (scope && scope.profile === 2) {
+      const clauses: string[] = []
+      if (scope.ownPartnerId) {
+        clauses.push(`p.\`id\` = ?`)
+        params.push(scope.ownPartnerId)
+      }
+      if (scope.userId) {
+        clauses.push(`p.\`coordinator\` = ?`)
+        params.push(scope.userId)
+      }
+      if (clauses.length === 0) return []
+      partnersQuery += ` AND (${clauses.join(' OR ')}) `
+    }
+
+    const [partners] = await dbPool.execute<RowDataPacket[]>(partnersQuery, params)
 
     // 2. Obtener pagos de socios
     const paymentsQuery = `

@@ -1,6 +1,7 @@
 import { ResultSetHeader, RowDataPacket } from 'mysql2'
 import { dbPool } from '../../shared/config/database'
 import { calculateQuotaByFrequency, formatDateOnly } from '../../shared/utils/date.utils'
+import { ViewerScope } from '../../shared/utils/scope.utils'
 
 export interface PaymentRowItemDTO {
   concept: string
@@ -36,9 +37,9 @@ export class PaymentsService {
     }
   }
 
-  // 1. Obtener todos los pagos individuales (retrocompatible)
-  async getAllPayments(): Promise<RowDataPacket[]> {
-    const query = `
+  // 1. Obtener todos los pagos individuales (retrocompatible y filtrado por perfil)
+  async getAllPayments(scope?: ViewerScope): Promise<RowDataPacket[]> {
+    let query = `
       SELECT 
         pay.\`id\`,
         pay.\`receiptId\`,
@@ -64,15 +65,36 @@ export class PaymentsService {
       LEFT JOIN \`partners\` p ON pay.\`partnerId\` = p.\`id\`
       LEFT JOIN \`raffle_external_tickets\` ext ON pay.\`externalTicketId\` = ext.\`id\`
       INNER JOIN \`users\` u ON pay.\`registeredBy\` = u.\`id\`
-      ORDER BY pay.\`id\` DESC
     `
-    const [rows] = await dbPool.execute<RowDataPacket[]>(query)
+    const params: any[] = []
+    if (scope && scope.profile === 3) {
+      if (!scope.ownPartnerId) return []
+      query += ` WHERE pay.\`partnerId\` = ? `
+      params.push(scope.ownPartnerId)
+    } else if (scope && scope.profile === 2) {
+      const clauses: string[] = []
+      if (scope.ownPartnerId) {
+        clauses.push(`pay.\`partnerId\` = ?`)
+        params.push(scope.ownPartnerId)
+      }
+      if (scope.userId) {
+        clauses.push(`p.\`coordinator\` = ?`)
+        params.push(scope.userId)
+        clauses.push(`ext.\`coordinatorId\` = ?`)
+        params.push(scope.userId)
+      }
+      if (clauses.length === 0) return []
+      query += ` WHERE (${clauses.join(' OR ')}) `
+    }
+
+    query += ` ORDER BY pay.\`id\` DESC `
+    const [rows] = await dbPool.execute<RowDataPacket[]>(query, params)
     return rows
   }
 
-  // 1B. Obtener listado CONSOLIDADO por recibo único (1 fila por payment_receipts)
-  async getConsolidatedReceipts(): Promise<any[]> {
-    const receiptsQuery = `
+  // 1B. Obtener listado CONSOLIDADO por recibo único (1 fila por payment_receipts, filtrado por perfil)
+  async getConsolidatedReceipts(scope?: ViewerScope): Promise<any[]> {
+    let receiptsQuery = `
       SELECT
         r.\`id\`,
         r.\`receiptType\`,
@@ -93,9 +115,30 @@ export class PaymentsService {
       LEFT JOIN \`partners\` p ON r.\`partnerId\` = p.\`id\`
       LEFT JOIN \`raffle_external_tickets\` ext ON r.\`externalTicketId\` = ext.\`id\`
       INNER JOIN \`users\` u ON r.\`registeredBy\` = u.\`id\`
-      ORDER BY r.\`id\` DESC
     `
-    const [receipts] = await dbPool.execute<RowDataPacket[]>(receiptsQuery)
+    const params: any[] = []
+    if (scope && scope.profile === 3) {
+      if (!scope.ownPartnerId) return []
+      receiptsQuery += ` WHERE r.\`partnerId\` = ? `
+      params.push(scope.ownPartnerId)
+    } else if (scope && scope.profile === 2) {
+      const clauses: string[] = []
+      if (scope.ownPartnerId) {
+        clauses.push(`r.\`partnerId\` = ?`)
+        params.push(scope.ownPartnerId)
+      }
+      if (scope.userId) {
+        clauses.push(`p.\`coordinator\` = ?`)
+        params.push(scope.userId)
+        clauses.push(`ext.\`coordinatorId\` = ?`)
+        params.push(scope.userId)
+      }
+      if (clauses.length === 0) return []
+      receiptsQuery += ` WHERE (${clauses.join(' OR ')}) `
+    }
+
+    receiptsQuery += ` ORDER BY r.\`id\` DESC `
+    const [receipts] = await dbPool.execute<RowDataPacket[]>(receiptsQuery, params)
 
     const itemsQuery = `
       SELECT

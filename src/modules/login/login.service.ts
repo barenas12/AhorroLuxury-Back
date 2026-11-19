@@ -4,6 +4,7 @@ import { dbPool } from '../../shared/config/database'
 
 export interface UserRecord extends RowDataPacket {
   id: number
+  partnerId: number | null
   name: string
   lastName: string
   full_name: string
@@ -27,6 +28,7 @@ export class LoginService {
     const query = `
       SELECT 
         u.\`id\`,
+        p.\`id\` AS \`partnerId\`,
         u.\`name\`,
         u.\`lastName\`,
         CONCAT_WS(' ', u.\`name\`, u.\`lastName\`) AS \`full_name\`,

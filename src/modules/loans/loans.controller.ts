@@ -1,12 +1,14 @@
 import { Request, Response } from 'express'
 import { LoansService } from './loans.service'
+import { resolveViewerScope } from '../../shared/utils/scope.utils'
 
 const loansService = new LoansService()
 
 export class LoansController {
-  async list(_req: Request, res: Response): Promise<void> {
+  async list(req: Request, res: Response): Promise<void> {
     try {
-      const data = await loansService.getAllLoans()
+      const scope = await resolveViewerScope(req)
+      const data = await loansService.getAllLoans(scope)
       res.status(200).json({ success: true, data })
     } catch (error: any) {
       res.status(500).json({ success: false, message: error.message })

@@ -2,6 +2,7 @@ import { ResultSetHeader, RowDataPacket } from 'mysql2'
 import bcrypt from 'bcrypt'
 import { dbPool } from '../../shared/config/database'
 import { calculateQuotaByFrequency, formatDateOnly } from '../../shared/utils/date.utils'
+import { ViewerScope } from '../../shared/utils/scope.utils'
 
 export interface CreateUserDTO {
   documentId: string
@@ -117,8 +118,8 @@ export class UsersService {
     }
   }
 
-  // 1. Obtener socios con ambos campos de boletas, fecha inicio y cuota calculada
-  async getAllUsers(partnerStatusFilter?: number): Promise<any[]> {
+  // 1. Obtener socios con ambos campos de boletas, fecha inicio y cuota calculada (filtrado por perfil)
+  async getAllUsers(partnerStatusFilter?: number, scope?: ViewerScope): Promise<any[]> {
     let query = `
       SELECT 
         p.\`id\`,
@@ -145,11 +146,34 @@ export class UsersService {
       LEFT JOIN \`users\` u ON CAST(p.\`documentId\` AS CHAR(100)) = CAST(u.\`user\` AS CHAR(100))
       LEFT JOIN \`users\` coord ON p.\`coordinator\` = coord.\`id\`
     `
+    const conditions: string[] = []
     const params: any[] = []
 
     if (partnerStatusFilter !== undefined && !isNaN(partnerStatusFilter)) {
-      query += ` WHERE COALESCE(p.\`status\`, 1) = ? `
+      conditions.push(`COALESCE(p.\`status\`, 1) = ?`)
       params.push(partnerStatusFilter)
+    }
+
+    if (scope && scope.profile === 3) {
+      if (!scope.ownPartnerId) return []
+      conditions.push(`p.\`id\` = ?`)
+      params.push(scope.ownPartnerId)
+    } else if (scope && scope.profile === 2) {
+      const scopeClauses: string[] = []
+      if (scope.ownPartnerId) {
+        scopeClauses.push(`p.\`id\` = ?`)
+        params.push(scope.ownPartnerId)
+      }
+      if (scope.userId) {
+        scopeClauses.push(`p.\`coordinator\` = ?`)
+        params.push(scope.userId)
+      }
+      if (scopeClauses.length === 0) return []
+      conditions.push(`(${scopeClauses.join(' OR ')})`)
+    }
+
+    if (conditions.length > 0) {
+      query += ` WHERE ${conditions.join(' AND ')} `
     }
 
     query += ` ORDER BY p.\`id\` DESC `
@@ -322,26 +346,27 @@ export class UsersService {
     }
   }
 
-  // 5. Consulta de Cuadrícula de Rifa (00 al 99) incluyendo socios, externos y estado de pago
-  async getRaffleBoard(raffleType: '1' | '2'): Promise<any[]> {
+  // 5. Consulta de Cuadrícula de Rifa (00 al 99 para Admin; solo boletas propias/a cargo para Coord y Socio)
+  async getRaffleBoard(raffleType: '1' | '2', scope?: ViewerScope): Promise<any[]> {
     const raffleNum = raffleType === '2' ? 2 : 1
     const column = raffleNum === 2 ? 'ticket2' : 'ticket'
 
-    const partnersQuery = `
+    let partnersQuery = `
       SELECT 
         p.\`id\`, 
         p.\`documentId\`, 
         CONCAT_WS(' ', p.\`name\`, p.\`lastName\`) AS \`fullName\`,
         p.\`cellphone\`,
+        p.\`coordinator\`,
         COALESCE(CONCAT_WS(' ', coord.\`name\`, coord.\`lastName\`), 'Sin asignar') AS \`coordinatorName\`,
         p.\`${column}\` AS \`tickets\`
       FROM \`partners\` p
       LEFT JOIN \`users\` coord ON p.\`coordinator\` = coord.\`id\`
       WHERE COALESCE(p.\`status\`, 1) = 1 AND p.\`${column}\` IS NOT NULL AND p.\`${column}\` != ''
     `
-    const [partnerRows] = await dbPool.execute<RowDataPacket[]>(partnersQuery)
+    const partnerParams: any[] = []
 
-    const externalQuery = `
+    let externalQuery = `
       SELECT
         e.\`id\`,
         e.\`ticketNumber\`,
@@ -353,7 +378,39 @@ export class UsersService {
       LEFT JOIN \`users\` coord ON e.\`coordinatorId\` = coord.\`id\`
       WHERE e.\`raffleType\` = ?
     `
-    const [externalRows] = await dbPool.execute<RowDataPacket[]>(externalQuery, [raffleNum])
+    const externalParams: any[] = [raffleNum]
+    let includeExternals = true
+
+    if (scope && scope.profile === 3) {
+      if (!scope.ownPartnerId) return []
+      partnersQuery += ` AND p.\`id\` = ? `
+      partnerParams.push(scope.ownPartnerId)
+      includeExternals = false
+    } else if (scope && scope.profile === 2) {
+      const clauses: string[] = []
+      if (scope.ownPartnerId) {
+        clauses.push(`p.\`id\` = ?`)
+        partnerParams.push(scope.ownPartnerId)
+      }
+      if (scope.userId) {
+        clauses.push(`p.\`coordinator\` = ?`)
+        partnerParams.push(scope.userId)
+      }
+      if (clauses.length === 0) return []
+      partnersQuery += ` AND (${clauses.join(' OR ')}) `
+
+      if (scope.userId) {
+        externalQuery += ` AND e.\`coordinatorId\` = ? `
+        externalParams.push(scope.userId)
+      } else {
+        includeExternals = false
+      }
+    }
+
+    const [partnerRows] = await dbPool.execute<RowDataPacket[]>(partnersQuery, partnerParams)
+    const [externalRows] = includeExternals
+      ? await dbPool.execute<RowDataPacket[]>(externalQuery, externalParams)
+      : ([[]] as unknown as [RowDataPacket[]])
 
     const [paidRows] = await dbPool.execute<RowDataPacket[]>(
       `
@@ -381,7 +438,66 @@ export class UsersService {
       )
     }
 
-    // Mapa de 00 al 99
+    // Para Coordinador (2) y Socio (3): devolver ÚNICAMENTE las boletas asignadas a su alcance (Opción A)
+    if (scope && (scope.profile === 2 || scope.profile === 3)) {
+      const scopedList: any[] = []
+
+      for (const row of partnerRows) {
+        const partnerTickets = this.parseTicketsSafe(row.tickets)
+        for (const t of partnerTickets) {
+          const index = parseInt(t, 10)
+          if (index >= 0 && index <= 99) {
+            const numStr = index.toString().padStart(2, '0')
+            const isPaid = isPartnerTicketPaid(Number(row.id), numStr)
+            scopedList.push({
+              number: numStr,
+              isAssigned: true,
+              assigneeType: 'partner',
+              isPaid,
+              paymentStatus: isPaid ? 'Al día' : 'En mora',
+              partner: {
+                id: row.id,
+                documentId: row.documentId,
+                fullName: row.fullName,
+                cellphone: row.cellphone,
+                coordinatorName: row.coordinatorName,
+                isExternal: false
+              }
+            })
+          }
+        }
+      }
+
+      for (const ext of externalRows) {
+        const index = parseInt(ext.ticketNumber, 10)
+        if (index >= 0 && index <= 99) {
+          const numStr = index.toString().padStart(2, '0')
+          const isPaid = isExternalTicketPaid(Number(ext.id), numStr)
+          scopedList.push({
+            number: numStr,
+            isAssigned: true,
+            assigneeType: 'external',
+            isPaid,
+            paymentStatus: isPaid ? 'Al día' : 'En mora',
+            partner: {
+              id: ext.id,
+              externalTicketId: ext.id,
+              documentId: 'Externo',
+              fullName: ext.fullName,
+              cellphone: ext.cellphone,
+              coordinatorId: ext.coordinatorId,
+              coordinatorName: ext.coordinatorName,
+              isExternal: true
+            }
+          })
+        }
+      }
+
+      scopedList.sort((a, b) => parseInt(a.number, 10) - parseInt(b.number, 10))
+      return scopedList
+    }
+
+    // Mapa completo de 00 al 99 para Administrador (1)
     const board: any[] = []
     for (let i = 0; i <= 99; i++) {
       const numStr = i.toString().padStart(2, '0')

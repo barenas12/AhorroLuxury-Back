@@ -8,6 +8,7 @@ import {
   getTodayUTC,
   parseDateOnlyUTC
 } from '../../shared/utils/date.utils'
+import { ViewerScope } from '../../shared/utils/scope.utils'
 
 export interface CreateLoanDTO {
   partnerId: number
@@ -118,8 +119,8 @@ export class LoansService {
     }
   }
 
-  async getAllLoans(): Promise<any[]> {
-    const query = `
+  async getAllLoans(scope?: ViewerScope): Promise<any[]> {
+    let query = `
       SELECT 
         l.\`id\`, l.\`partnerId\`, l.\`initialCapital\`, l.\`interestRate\`,
         l.\`settledInterestBase\`, l.\`interestAdjustment\`, l.\`condonedInterest\`,
@@ -146,9 +147,29 @@ export class LoansService {
         WHERE \`loanId\` IS NOT NULL
         GROUP BY \`loanId\`
       ) pay ON l.\`id\` = pay.\`loanId\`
-      ORDER BY l.\`id\` DESC
     `
-    const [rows] = await dbPool.execute<RowDataPacket[]>(query)
+    const params: any[] = []
+
+    if (scope && scope.profile === 3) {
+      if (!scope.ownPartnerId) return []
+      query += ` WHERE l.\`partnerId\` = ? `
+      params.push(scope.ownPartnerId)
+    } else if (scope && scope.profile === 2) {
+      const clauses: string[] = []
+      if (scope.ownPartnerId) {
+        clauses.push(`l.\`partnerId\` = ?`)
+        params.push(scope.ownPartnerId)
+      }
+      if (scope.userId) {
+        clauses.push(`p.\`coordinator\` = ?`)
+        params.push(scope.userId)
+      }
+      if (clauses.length === 0) return []
+      query += ` WHERE (${clauses.join(' OR ')}) `
+    }
+
+    query += ` ORDER BY l.\`id\` DESC `
+    const [rows] = await dbPool.execute<RowDataPacket[]>(query, params)
     return rows.map((row) => this.computeLoanMetrics(row))
   }
 

@@ -1,5 +1,6 @@
 import { Request, Response } from "express";
 import { UsersService } from "./users.service";
+import { resolveViewerScope } from "../../shared/utils/scope.utils";
 
 const usersService = new UsersService();
 
@@ -8,7 +9,8 @@ export class UsersController {
     try {
       const statusParam =
         req.query.status !== undefined ? Number(req.query.status) : undefined;
-      const users = await usersService.getAllUsers(statusParam);
+      const scope = await resolveViewerScope(req);
+      const users = await usersService.getAllUsers(statusParam, scope);
       res.status(200).json({ success: true, data: users });
     } catch (error: any) {
       res.status(500).json({ success: false, message: error.message });
@@ -98,7 +100,8 @@ export class UsersController {
   async getRaffle(req: Request, res: Response): Promise<void> {
     try {
       const type = req.params.type === "2" ? "2" : "1";
-      const board = await usersService.getRaffleBoard(type);
+      const scope = await resolveViewerScope(req);
+      const board = await usersService.getRaffleBoard(type, scope);
       res.status(200).json({ success: true, data: board });
     } catch (error: any) {
       res.status(500).json({ success: false, message: error.message });

@@ -1,10 +1,14 @@
--- Migración compatible con MySQL 8 y TiDB Cloud (1 operación por ALTER TABLE)
+USE `luxury`;
 
--- 1. Tabla partners: fecha de inicio de ahorro y fecha en que quedó al día
+-- ============================================================
+-- 1. Tabla partners: fecha de inicio de ahorro y fecha "Al día"
+-- ============================================================
 ALTER TABLE `partners` ADD COLUMN `savingsStartDate` DATE NULL DEFAULT NULL AFTER `frequency`;
 ALTER TABLE `partners` ADD COLUMN `savingsUpToDateAt` DATE NULL DEFAULT NULL AFTER `statusValue`;
 
--- 2. Tabla loans: agregar 'Negocio' al ENUM de guarantee, dueDate NULL, y columnas de flexibilidad / intereses al día
+-- ============================================================
+-- 2. Tabla loans: garantía 'Negocio'/'Otro', dueDate NULL e intereses flexibles
+-- ============================================================
 ALTER TABLE `loans` MODIFY COLUMN `guarantee` ENUM('Oro','Prenda','Sin Prenda','Otro','Negocio') NOT NULL DEFAULT 'Sin Prenda';
 ALTER TABLE `loans` MODIFY COLUMN `dueDate` DATE NULL DEFAULT NULL;
 ALTER TABLE `loans` ADD COLUMN `settledInterestBase` DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER `interestRate`;
@@ -12,7 +16,9 @@ ALTER TABLE `loans` ADD COLUMN `interestAdjustment` DECIMAL(12,2) NOT NULL DEFAU
 ALTER TABLE `loans` ADD COLUMN `condonedInterest` DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER `interestAdjustment`;
 ALTER TABLE `loans` ADD COLUMN `lastInterestUpToDateAt` DATE NULL DEFAULT NULL AFTER `termDays`;
 
--- 3. Nueva tabla para boletas compradas por personas externas (por afuera)
+-- ============================================================
+-- 3. Nueva tabla: boletas compradas por personas externas (por afuera)
+-- ============================================================
 CREATE TABLE IF NOT EXISTS `raffle_external_tickets` (
   `id` INT(11) NOT NULL AUTO_INCREMENT,
   `raffleType` TINYINT(1) NOT NULL COMMENT '1 = Rifa 1, 2 = Rifa 2',
@@ -27,7 +33,9 @@ CREATE TABLE IF NOT EXISTS `raffle_external_tickets` (
   CONSTRAINT `fk_ext_ticket_coordinator` FOREIGN KEY (`coordinatorId`) REFERENCES `users` (`id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
--- 4. Nueva tabla consolidado de recibos (ID único para 1 o múltiples pagos)
+-- ============================================================
+-- 4. Nueva tabla: consolidado de recibos (ID único para PDF)
+-- ============================================================
 CREATE TABLE IF NOT EXISTS `payment_receipts` (
   `id` INT(11) NOT NULL AUTO_INCREMENT,
   `receiptType` ENUM('payment','loan_payment') NOT NULL DEFAULT 'payment',
@@ -51,7 +59,9 @@ CREATE TABLE IF NOT EXISTS `payment_receipts` (
   CONSTRAINT `fk_receipt_user` FOREIGN KEY (`registeredBy`) REFERENCES `users` (`id`) ON UPDATE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
--- 5. Tabla payments: soportar externos, diferenciar rifa y vincular al recibo consolidado
+-- ============================================================
+-- 5. Tabla payments: externos, rifa y vínculo a payment_receipts
+-- ============================================================
 ALTER TABLE `payments` MODIFY COLUMN `partnerId` INT(11) NULL DEFAULT NULL;
 ALTER TABLE `payments` ADD COLUMN `externalTicketId` INT(11) NULL DEFAULT NULL AFTER `partnerId`;
 ALTER TABLE `payments` ADD COLUMN `raffleType` TINYINT(1) NULL DEFAULT NULL AFTER `ticketNumber`;
@@ -60,3 +70,39 @@ ALTER TABLE `payments` ADD KEY `idx_payments_ext` (`externalTicketId`);
 ALTER TABLE `payments` ADD KEY `idx_payments_receipt` (`receiptId`);
 ALTER TABLE `payments` ADD CONSTRAINT `fk_payments_ext` FOREIGN KEY (`externalTicketId`) REFERENCES `raffle_external_tickets` (`id`) ON DELETE SET NULL;
 ALTER TABLE `payments` ADD CONSTRAINT `fk_payments_receipt` FOREIGN KEY (`receiptId`) REFERENCES `payment_receipts` (`id`) ON DELETE SET NULL;
+
+-- ============================================================
+-- 6. Backfill: consolidar los pagos históricos existentes en payment_receipts
+-- ============================================================
+INSERT INTO `payment_receipts` (
+  `receiptType`,
+  `partnerId`,
+  `externalTicketId`,
+  `loanId`,
+  `paymentIds`,
+  `totalAmount`,
+  `paymentDate`,
+  `registeredBy`,
+  `observations`,
+  `createdAt`
+)
+SELECT
+  CASE WHEN `loanId` IS NOT NULL THEN 'loan_payment' ELSE 'payment' END,
+  `partnerId`,
+  NULL,
+  `loanId`,
+  JSON_ARRAYAGG(`id`),
+  SUM(`amount` + `fineAmount`),
+  `paymentDate`,
+  `registeredBy`,
+  NULLIF(GROUP_CONCAT(NULLIF(`observations`, '') SEPARATOR ' | '), ''),
+  `createdAt`
+FROM `payments`
+WHERE `receiptId` IS NULL
+GROUP BY `partnerId`, `loanId`, `registeredBy`, `paymentDate`, `createdAt`;
+
+UPDATE `payments` p
+INNER JOIN `payment_receipts` r
+  ON JSON_CONTAINS(r.`paymentIds`, CAST(p.`id` AS JSON))
+SET p.`receiptId` = r.`id`
+WHERE p.`receiptId` IS NULL;

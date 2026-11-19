@@ -1,21 +1,24 @@
 import { Request, Response } from 'express'
 import { PaymentsService } from './payments.service'
+import { resolveViewerScope } from '../../shared/utils/scope.utils'
 
 const paymentsService = new PaymentsService()
 
 export class PaymentsController {
-  async list(_req: Request, res: Response): Promise<void> {
+  async list(req: Request, res: Response): Promise<void> {
     try {
-      const payments = await paymentsService.getAllPayments()
+      const scope = await resolveViewerScope(req)
+      const payments = await paymentsService.getAllPayments(scope)
       res.status(200).json({ success: true, data: payments })
     } catch (error: any) {
       res.status(500).json({ success: false, message: error.message })
     }
   }
 
-  async listConsolidated(_req: Request, res: Response): Promise<void> {
+  async listConsolidated(req: Request, res: Response): Promise<void> {
     try {
-      const receipts = await paymentsService.getConsolidatedReceipts()
+      const scope = await resolveViewerScope(req)
+      const receipts = await paymentsService.getConsolidatedReceipts(scope)
       res.status(200).json({ success: true, data: receipts })
     } catch (error: any) {
       res.status(500).json({ success: false, message: error.message })
