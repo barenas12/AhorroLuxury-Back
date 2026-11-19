@@ -1,16 +1,16 @@
--- 1. Tabla partners: fecha de inicio de ahorro y fecha en que quedó al día
-ALTER TABLE `partners`
-  ADD COLUMN `savingsStartDate` DATE NULL DEFAULT NULL AFTER `frequency`,
-  ADD COLUMN `savingsUpToDateAt` DATE NULL DEFAULT NULL AFTER `statusValue`;
+-- Migración compatible con MySQL 8 y TiDB Cloud (1 operación por ALTER TABLE)
 
--- 2. Tabla loans: agregar 'Negocio' a guarantee, dueDate NULL, y columnas de flexibilidad / intereses al día
-ALTER TABLE `loans`
-  MODIFY COLUMN `guarantee` ENUM('Oro','Prenda','Sin Prenda','Negocio','Otro') NOT NULL DEFAULT 'Sin Prenda',
-  MODIFY COLUMN `dueDate` DATE NULL DEFAULT NULL,
-  ADD COLUMN `settledInterestBase` DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER `interestRate`,
-  ADD COLUMN `interestAdjustment` DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER `settledInterestBase`,
-  ADD COLUMN `condonedInterest` DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER `interestAdjustment`,
-  ADD COLUMN `lastInterestUpToDateAt` DATE NULL DEFAULT NULL AFTER `termDays`;
+-- 1. Tabla partners: fecha de inicio de ahorro y fecha en que quedó al día
+ALTER TABLE `partners` ADD COLUMN `savingsStartDate` DATE NULL DEFAULT NULL AFTER `frequency`;
+ALTER TABLE `partners` ADD COLUMN `savingsUpToDateAt` DATE NULL DEFAULT NULL AFTER `statusValue`;
+
+-- 2. Tabla loans: agregar 'Negocio' al ENUM de guarantee, dueDate NULL, y columnas de flexibilidad / intereses al día
+ALTER TABLE `loans` MODIFY COLUMN `guarantee` ENUM('Oro','Prenda','Sin Prenda','Otro','Negocio') NOT NULL DEFAULT 'Sin Prenda';
+ALTER TABLE `loans` MODIFY COLUMN `dueDate` DATE NULL DEFAULT NULL;
+ALTER TABLE `loans` ADD COLUMN `settledInterestBase` DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER `interestRate`;
+ALTER TABLE `loans` ADD COLUMN `interestAdjustment` DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER `settledInterestBase`;
+ALTER TABLE `loans` ADD COLUMN `condonedInterest` DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER `interestAdjustment`;
+ALTER TABLE `loans` ADD COLUMN `lastInterestUpToDateAt` DATE NULL DEFAULT NULL AFTER `termDays`;
 
 -- 3. Nueva tabla para boletas compradas por personas externas (por afuera)
 CREATE TABLE IF NOT EXISTS `raffle_external_tickets` (
@@ -49,15 +49,14 @@ CREATE TABLE IF NOT EXISTS `payment_receipts` (
   CONSTRAINT `fk_receipt_ext` FOREIGN KEY (`externalTicketId`) REFERENCES `raffle_external_tickets` (`id`) ON DELETE SET NULL,
   CONSTRAINT `fk_receipt_loan` FOREIGN KEY (`loanId`) REFERENCES `loans` (`id`) ON DELETE CASCADE,
   CONSTRAINT `fk_receipt_user` FOREIGN KEY (`registeredBy`) REFERENCES `users` (`id`) ON UPDATE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 -- 5. Tabla payments: soportar externos, diferenciar rifa y vincular al recibo consolidado
-ALTER TABLE `payments`
-  MODIFY COLUMN `partnerId` INT(11) NULL DEFAULT NULL,
-  ADD COLUMN `externalTicketId` INT(11) NULL DEFAULT NULL AFTER `partnerId`,
-  ADD COLUMN `raffleType` TINYINT(1) NULL DEFAULT NULL AFTER `ticketNumber`,
-  ADD COLUMN `receiptId` INT(11) NULL DEFAULT NULL AFTER `loanId`,
-  ADD KEY `idx_payments_ext` (`externalTicketId`),
-  ADD KEY `idx_payments_receipt` (`receiptId`),
-  ADD CONSTRAINT `fk_payments_ext` FOREIGN KEY (`externalTicketId`) REFERENCES `raffle_external_tickets` (`id`) ON DELETE SET NULL,
-  ADD CONSTRAINT `fk_payments_receipt` FOREIGN KEY (`receiptId`) REFERENCES `payment_receipts` (`id`) ON DELETE SET NULL;
+ALTER TABLE `payments` MODIFY COLUMN `partnerId` INT(11) NULL DEFAULT NULL;
+ALTER TABLE `payments` ADD COLUMN `externalTicketId` INT(11) NULL DEFAULT NULL AFTER `partnerId`;
+ALTER TABLE `payments` ADD COLUMN `raffleType` TINYINT(1) NULL DEFAULT NULL AFTER `ticketNumber`;
+ALTER TABLE `payments` ADD COLUMN `receiptId` INT(11) NULL DEFAULT NULL AFTER `loanId`;
+ALTER TABLE `payments` ADD KEY `idx_payments_ext` (`externalTicketId`);
+ALTER TABLE `payments` ADD KEY `idx_payments_receipt` (`receiptId`);
+ALTER TABLE `payments` ADD CONSTRAINT `fk_payments_ext` FOREIGN KEY (`externalTicketId`) REFERENCES `raffle_external_tickets` (`id`) ON DELETE SET NULL;
+ALTER TABLE `payments` ADD CONSTRAINT `fk_payments_receipt` FOREIGN KEY (`receiptId`) REFERENCES `payment_receipts` (`id`) ON DELETE SET NULL;
