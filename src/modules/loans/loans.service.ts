@@ -132,13 +132,20 @@ export class LoansService {
         CONCAT_WS(' ', p.\`name\`, p.\`lastName\`) AS \`partnerName\`,
         p.\`documentId\`,
         CONCAT_WS(' ', u.\`name\`, u.\`lastName\`) AS \`registeredByName\`,
-        COALESCE(SUM(CASE WHEN pay.\`concept\` = 'Abono Capital Préstamo' THEN pay.\`amount\` ELSE 0 END), 0) AS \`paidCapital\`,
-        COALESCE(SUM(CASE WHEN pay.\`concept\` = 'Abono Interés Préstamo' THEN pay.\`amount\` ELSE 0 END), 0) AS \`paidInterest\`
+        COALESCE(pay.\`paidCapital\`, 0) AS \`paidCapital\`,
+        COALESCE(pay.\`paidInterest\`, 0) AS \`paidInterest\`
       FROM \`loans\` l
       JOIN \`partners\` p ON l.\`partnerId\` = p.\`id\`
       JOIN \`users\` u ON l.\`registeredBy\` = u.\`id\`
-      LEFT JOIN \`payments\` pay ON l.\`id\` = pay.\`loanId\`
-      GROUP BY l.\`id\`
+      LEFT JOIN (
+        SELECT
+          \`loanId\`,
+          COALESCE(SUM(CASE WHEN \`concept\` = 'Abono Capital Préstamo' THEN \`amount\` ELSE 0 END), 0) AS \`paidCapital\`,
+          COALESCE(SUM(CASE WHEN \`concept\` = 'Abono Interés Préstamo' THEN \`amount\` ELSE 0 END), 0) AS \`paidInterest\`
+        FROM \`payments\`
+        WHERE \`loanId\` IS NOT NULL
+        GROUP BY \`loanId\`
+      ) pay ON l.\`id\` = pay.\`loanId\`
       ORDER BY l.\`id\` DESC
     `
     const [rows] = await dbPool.execute<RowDataPacket[]>(query)
@@ -159,16 +166,23 @@ export class LoansService {
         CONCAT_WS(' ', p.\`name\`, p.\`lastName\`) AS \`partnerName\`,
         p.\`documentId\`,
         CONCAT_WS(' ', u.\`name\`, u.\`lastName\`) AS \`registeredByName\`,
-        COALESCE(SUM(CASE WHEN pay.\`concept\` = 'Abono Capital Préstamo' THEN pay.\`amount\` ELSE 0 END), 0) AS \`paidCapital\`,
-        COALESCE(SUM(CASE WHEN pay.\`concept\` = 'Abono Interés Préstamo' THEN pay.\`amount\` ELSE 0 END), 0) AS \`paidInterest\`
+        COALESCE(pay.\`paidCapital\`, 0) AS \`paidCapital\`,
+        COALESCE(pay.\`paidInterest\`, 0) AS \`paidInterest\`
       FROM \`loans\` l
       JOIN \`partners\` p ON l.\`partnerId\` = p.\`id\`
       JOIN \`users\` u ON l.\`registeredBy\` = u.\`id\`
-      LEFT JOIN \`payments\` pay ON l.\`id\` = pay.\`loanId\`
+      LEFT JOIN (
+        SELECT
+          \`loanId\`,
+          COALESCE(SUM(CASE WHEN \`concept\` = 'Abono Capital Préstamo' THEN \`amount\` ELSE 0 END), 0) AS \`paidCapital\`,
+          COALESCE(SUM(CASE WHEN \`concept\` = 'Abono Interés Préstamo' THEN \`amount\` ELSE 0 END), 0) AS \`paidInterest\`
+        FROM \`payments\`
+        WHERE \`loanId\` = ?
+        GROUP BY \`loanId\`
+      ) pay ON l.\`id\` = pay.\`loanId\`
       WHERE l.\`id\` = ?
-      GROUP BY l.\`id\`
     `
-    const [rows] = await dbPool.execute<RowDataPacket[]>(query, [loanId])
+    const [rows] = await dbPool.execute<RowDataPacket[]>(query, [loanId, loanId])
     if (rows.length === 0) throw new Error('Préstamo no encontrado.')
     return this.computeLoanMetrics(rows[0])
   }
@@ -316,14 +330,21 @@ export class LoansService {
             l.\`termDays\`,
             DATE_FORMAT(l.\`lastInterestUpToDateAt\`, '%Y-%m-%d') AS \`lastInterestUpToDateAt\`,
             l.\`status\`,
-            COALESCE(SUM(CASE WHEN pay.\`concept\` = 'Abono Capital Préstamo' THEN pay.\`amount\` ELSE 0 END), 0) AS \`paidCapital\`,
-            COALESCE(SUM(CASE WHEN pay.\`concept\` = 'Abono Interés Préstamo' THEN pay.\`amount\` ELSE 0 END), 0) AS \`paidInterest\`
+            COALESCE(pay.\`paidCapital\`, 0) AS \`paidCapital\`,
+            COALESCE(pay.\`paidInterest\`, 0) AS \`paidInterest\`
           FROM \`loans\` l
-          LEFT JOIN \`payments\` pay ON l.\`id\` = pay.\`loanId\`
+          LEFT JOIN (
+            SELECT
+              \`loanId\`,
+              COALESCE(SUM(CASE WHEN \`concept\` = 'Abono Capital Préstamo' THEN \`amount\` ELSE 0 END), 0) AS \`paidCapital\`,
+              COALESCE(SUM(CASE WHEN \`concept\` = 'Abono Interés Préstamo' THEN \`amount\` ELSE 0 END), 0) AS \`paidInterest\`
+            FROM \`payments\`
+            WHERE \`loanId\` = ?
+            GROUP BY \`loanId\`
+          ) pay ON l.\`id\` = pay.\`loanId\`
           WHERE l.\`id\` = ?
-          GROUP BY l.\`id\`
         `,
-        [loanId]
+        [loanId, loanId]
       )
       if (loanRows.length === 0) throw new Error('Préstamo no encontrado.')
       const loanRow = loanRows[0]
