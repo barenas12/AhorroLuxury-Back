@@ -46,13 +46,12 @@ export class DashboardService {
 
   // Resumen personal y de grupo + disponibilidad de módulos para Coordinador (2) y Socio (3)
   async getPersonalSummary(scope: ViewerScope): Promise<any> {
-    const [savingsList, loansList, receiptsList, rifa1List, rifa2List, usersList] = await Promise.all([
+    const [savingsList, loansList, receiptsList, rifa1List, rifa2List] = await Promise.all([
       savingsService.getSavingsDashboard(scope),
       loansService.getAllLoans(scope),
       paymentsService.getConsolidatedReceipts(scope),
       usersService.getRaffleBoard('1', scope),
-      usersService.getRaffleBoard('2', scope),
-      scope.profile === 2 ? usersService.getAllUsers(undefined, scope) : Promise.resolve([])
+      usersService.getRaffleBoard('2', scope)
     ])
 
     const ownPartnerId = scope.ownPartnerId
@@ -102,7 +101,7 @@ export class DashboardService {
 
     // Disponibilidad dinámica de opciones del menú según registros existentes
     const availability = {
-      hasUsers: scope.profile === 1 || (scope.profile === 2 && usersList.length > 0),
+      hasUsers: scope.profile === 1,
       hasSavings: scope.profile === 1 || savingsList.length > 0,
       hasLoans: scope.profile === 1 || loansList.length > 0,
       hasRifa1: scope.profile === 1 || rifa1List.length > 0,

@@ -143,7 +143,15 @@ export class UsersService {
         COALESCE(u.\`status\`, 0) AS \`userLoginStatus\`,
         COALESCE(u.\`resetPassword\`, 0) AS \`resetPassword\`
       FROM \`partners\` p
-      LEFT JOIN \`users\` u ON CAST(p.\`documentId\` AS CHAR(100)) = CAST(u.\`user\` AS CHAR(100))
+      LEFT JOIN (
+        SELECT
+          CAST(\`user\` AS CHAR(100)) AS \`userDoc\`,
+          MIN(\`profile\`) AS \`profile\`,
+          MAX(\`status\`) AS \`status\`,
+          MAX(\`resetPassword\`) AS \`resetPassword\`
+        FROM \`users\`
+        GROUP BY CAST(\`user\` AS CHAR(100))
+      ) u ON CAST(p.\`documentId\` AS CHAR(100)) = u.\`userDoc\`
       LEFT JOIN \`users\` coord ON p.\`coordinator\` = coord.\`id\`
     `
     const conditions: string[] = []
