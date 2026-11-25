@@ -10,10 +10,14 @@ import {
 } from '../../shared/utils/date.utils'
 import { ViewerScope } from '../../shared/utils/scope.utils'
 
+export type LoanInterestMode = 'percentage' | 'fixed'
+
 export interface CreateLoanDTO {
   partnerId: number
   initialCapital: number
+  interestMode?: LoanInterestMode
   interestRate: number
+  fixedInterestAmount?: number | null
   initialInterestAmount?: number | null
   deliveryMethod: 'efectivo' | 'transferencia'
   guarantee: 'Oro' | 'Prenda' | 'Sin Prenda' | 'Negocio' | 'Otro'
@@ -37,13 +41,20 @@ export interface LoanPaymentDTO {
 }
 
 export interface UpdateLoanInterestDTO {
+  interestMode?: LoanInterestMode
   interestRate?: number
+  fixedInterestAmount?: number | null
   targetRemainingInterest?: number
 }
 
 export class LoansService {
   private computeLoanMetrics(loanRow: any, referenceDateStr?: string) {
     const initialCapital = Number(loanRow.initialCapital || 0)
+    const interestMode: LoanInterestMode = loanRow.interestMode === 'fixed' ? 'fixed' : 'percentage'
+    const fixedInterestAmount =
+      loanRow.fixedInterestAmount !== null && loanRow.fixedInterestAmount !== undefined
+        ? Math.max(0, Number(loanRow.fixedInterestAmount))
+        : null
     const interestRate = Number(loanRow.interestRate || 0)
     const termDays = Math.max(1, Number(loanRow.termDays || 30))
     const paidCapital = Number(loanRow.paidCapital || 0)
@@ -53,8 +64,11 @@ export class LoansService {
     const condonedInterest = Number(loanRow.condonedInterest || 0)
     const remainingCapital = Math.max(0, initialCapital - paidCapital)
 
-    // Interés del ciclo calculado sobre el capital inicial
-    const interestPerCycle = Math.round(initialCapital * (interestRate / 100))
+    // Interés simple por ciclo: valor fijo en pesos ($) o porcentaje (%) sobre el capital inicial
+    const interestPerCycle =
+      interestMode === 'fixed' && fixedInterestAmount !== null
+        ? Math.round(fixedInterestAmount)
+        : Math.round(initialCapital * (interestRate / 100))
 
     const refDate = (referenceDateStr ? parseDateOnlyUTC(referenceDateStr) : null) || getTodayUTC()
     const deliveryDate = parseDateOnlyUTC(loanRow.deliveryDate) || refDate
@@ -66,8 +80,11 @@ export class LoansService {
 
     if (lastResetDate) {
       const daysSinceReset = Math.max(0, diffDaysUTC(refDate, lastResetDate))
-      const newCyclesAfterReset = Math.floor(daysSinceReset / 30)
-      overdueTotalDays = loanRow.status === 'Pagado' ? 0 : (daysSinceReset >= 30 ? daysSinceReset : 0)
+      // Tras marcar "Intereses al día", el siguiente ciclo de 30 días cubre días 0..30;
+      // al día 31 (1 día en mora) entra inmediatamente un nuevo ciclo de 30 días.
+      const rawOverdueAfterReset = Math.max(0, daysSinceReset - 30)
+      const newCyclesAfterReset = rawOverdueAfterReset > 0 ? Math.ceil(rawOverdueAfterReset / 30) : 0
+      overdueTotalDays = loanRow.status === 'Pagado' ? 0 : rawOverdueAfterReset
       totalExpectedInterest = Math.max(
         0,
         settledInterestBase + newCyclesAfterReset * interestPerCycle + interestAdjustment
@@ -78,24 +95,24 @@ export class LoansService {
       const rawOverdueDays = Math.max(0, diffDaysUTC(refDate, dueDate))
       overdueTotalDays = loanRow.status === 'Pagado' ? 0 : rawOverdueDays
 
-      // Al solicitar el préstamo ya se suma el interés inicial (por % o manual en pesos vía interestAdjustment).
-      // Los intereses recurrentes por mora se suman siempre cada 30 días, nunca cada 15.
-      const extraCycles = Math.floor(rawOverdueDays / 30)
+      // Ciclo 1 cubre hasta deliveryDate + termDays.
+      // Al primer día en mora (rawOverdueDays >= 1) se suma inmediatamente el 2do ciclo (de 30 días),
+      // luego al día 31 de mora el 3er ciclo, etc.
+      const extraCycles = rawOverdueDays > 0 ? Math.ceil(rawOverdueDays / 30) : 0
 
       totalCycles = 1 + extraCycles
       totalExpectedInterest = Math.max(0, totalCycles * interestPerCycle + interestAdjustment)
     }
 
-    const remainingInterest =
-      loanRow.status === 'Pagado'
-        ? Math.max(0, totalExpectedInterest - paidInterest - condonedInterest)
-        : Math.max(0, totalExpectedInterest - paidInterest - condonedInterest)
+    const remainingInterest = Math.max(0, totalExpectedInterest - paidInterest - condonedInterest)
 
     const overdueInfo = formatOverdueDuration(overdueTotalDays)
 
     return {
       ...loanRow,
       initialCapital,
+      interestMode,
+      fixedInterestAmount,
       interestRate,
       termDays,
       installments: Number(loanRow.installments || 1),
@@ -123,6 +140,7 @@ export class LoansService {
     let query = `
       SELECT 
         l.\`id\`, l.\`partnerId\`, l.\`initialCapital\`, l.\`interestRate\`,
+        l.\`interestMode\`, l.\`fixedInterestAmount\`,
         l.\`settledInterestBase\`, l.\`interestAdjustment\`, l.\`condonedInterest\`,
         l.\`deliveryMethod\`, l.\`guarantee\`,
         DATE_FORMAT(l.\`deliveryDate\`, '%Y-%m-%d') AS \`deliveryDate\`,
@@ -177,6 +195,7 @@ export class LoansService {
     const query = `
       SELECT 
         l.\`id\`, l.\`partnerId\`, l.\`initialCapital\`, l.\`interestRate\`,
+        l.\`interestMode\`, l.\`fixedInterestAmount\`,
         l.\`settledInterestBase\`, l.\`interestAdjustment\`, l.\`condonedInterest\`,
         l.\`deliveryMethod\`, l.\`guarantee\`,
         DATE_FORMAT(l.\`deliveryDate\`, '%Y-%m-%d') AS \`deliveryDate\`,
@@ -270,26 +289,41 @@ export class LoansService {
   }
 
   async createLoan(data: CreateLoanDTO): Promise<number> {
-    const standardFirstCycle = Math.round(Number(data.initialCapital || 0) * (Number(data.interestRate || 0) / 100))
-    const hasManualInitial =
-      data.initialInterestAmount !== undefined &&
-      data.initialInterestAmount !== null &&
-      !isNaN(Number(data.initialInterestAmount))
-    const interestAdjustment = hasManualInitial
-      ? Math.max(0, Number(data.initialInterestAmount)) - standardFirstCycle
-      : 0
+    const capital = Number(data.initialCapital || 0)
+    const interestMode: LoanInterestMode = data.interestMode === 'fixed' ? 'fixed' : 'percentage'
+
+    let effectiveRate = Math.max(0, Number(data.interestRate || 0))
+    let fixedInterestAmount: number | null = null
+    let interestAdjustment = 0
+
+    if (interestMode === 'fixed') {
+      const rawFixed = Number(data.fixedInterestAmount ?? data.initialInterestAmount ?? 0)
+      fixedInterestAmount = Math.max(0, Math.round(isNaN(rawFixed) ? 0 : rawFixed))
+      effectiveRate = capital > 0 ? Number(((fixedInterestAmount / capital) * 100).toFixed(2)) : 0
+    } else {
+      const standardFirstCycle = Math.round(capital * (effectiveRate / 100))
+      const hasManualInitial =
+        data.initialInterestAmount !== undefined &&
+        data.initialInterestAmount !== null &&
+        !isNaN(Number(data.initialInterestAmount))
+      interestAdjustment = hasManualInitial
+        ? Math.max(0, Number(data.initialInterestAmount)) - standardFirstCycle
+        : 0
+    }
 
     const query = `
       INSERT INTO \`loans\` (
-        \`partnerId\`, \`initialCapital\`, \`interestRate\`, \`interestAdjustment\`, \`deliveryMethod\`, 
-        \`guarantee\`, \`deliveryDate\`, \`termDays\`, \`dueDate\`, \`installments\`, 
-        \`observations\`, \`registeredBy\`
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        \`partnerId\`, \`initialCapital\`, \`interestRate\`, \`interestMode\`, \`fixedInterestAmount\`,
+        \`interestAdjustment\`, \`deliveryMethod\`, \`guarantee\`, \`deliveryDate\`, \`termDays\`,
+        \`dueDate\`, \`installments\`, \`observations\`, \`registeredBy\`
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `
     const [result] = await dbPool.execute<ResultSetHeader>(query, [
       data.partnerId,
-      data.initialCapital,
-      data.interestRate,
+      capital,
+      effectiveRate,
+      interestMode,
+      fixedInterestAmount,
       interestAdjustment,
       data.deliveryMethod,
       data.guarantee,
@@ -306,18 +340,41 @@ export class LoansService {
   async updateLoanInterest(loanId: number, data: UpdateLoanInterestDTO): Promise<any> {
     const current = await this.getLoanById(loanId)
 
+    const nextMode: LoanInterestMode =
+      data.interestMode === 'fixed' || data.interestMode === 'percentage'
+        ? data.interestMode
+        : current.interestMode
+
     let nextRate = current.interestRate
-    if (data.interestRate !== undefined && !isNaN(Number(data.interestRate))) {
-      if (Number(data.interestRate) < 0) throw new Error('La tasa de interés no puede ser negativa.')
-      nextRate = Number(data.interestRate)
+    let nextFixedAmount: number | null = current.fixedInterestAmount
+
+    if (nextMode === 'fixed') {
+      const rawFixed =
+        data.fixedInterestAmount !== undefined && data.fixedInterestAmount !== null
+          ? Number(data.fixedInterestAmount)
+          : current.interestPerCycle
+      if (isNaN(rawFixed) || rawFixed < 0) throw new Error('El valor de interés fijo no puede ser negativo.')
+      nextFixedAmount = Math.round(rawFixed)
+      nextRate =
+        current.initialCapital > 0
+          ? Number(((nextFixedAmount / current.initialCapital) * 100).toFixed(2))
+          : 0
+    } else {
+      nextFixedAmount = null
+      if (data.interestRate !== undefined && !isNaN(Number(data.interestRate))) {
+        if (Number(data.interestRate) < 0) throw new Error('La tasa de interés no puede ser negativa.')
+        nextRate = Number(data.interestRate)
+      }
     }
 
-    // Recomputar métricas base con la nueva tasa y ajuste = 0 para calcular el delta si enviaron targetRemainingInterest
+    // Recomputar métricas base con el nuevo modo/tasa y ajuste = 0 para calcular el delta si enviaron targetRemainingInterest
     let nextAdjustment = current.interestAdjustment
     if (data.targetRemainingInterest !== undefined && !isNaN(Number(data.targetRemainingInterest))) {
       const target = Math.max(0, Number(data.targetRemainingInterest))
       const baseWithZeroAdj = this.computeLoanMetrics({
         ...current,
+        interestMode: nextMode,
+        fixedInterestAmount: nextFixedAmount,
         interestRate: nextRate,
         interestAdjustment: 0
       })
@@ -327,8 +384,8 @@ export class LoansService {
     }
 
     await dbPool.execute(
-      `UPDATE \`loans\` SET \`interestRate\` = ?, \`interestAdjustment\` = ? WHERE \`id\` = ?`,
-      [nextRate, nextAdjustment, loanId]
+      `UPDATE \`loans\` SET \`interestMode\` = ?, \`fixedInterestAmount\` = ?, \`interestRate\` = ?, \`interestAdjustment\` = ? WHERE \`id\` = ?`,
+      [nextMode, nextFixedAmount, nextRate, nextAdjustment, loanId]
     )
 
     return this.getLoanById(loanId)
@@ -346,6 +403,7 @@ export class LoansService {
         `
           SELECT
             l.\`id\`, l.\`partnerId\`, l.\`initialCapital\`, l.\`interestRate\`,
+            l.\`interestMode\`, l.\`fixedInterestAmount\`,
             l.\`settledInterestBase\`, l.\`interestAdjustment\`, l.\`condonedInterest\`,
             DATE_FORMAT(l.\`deliveryDate\`, '%Y-%m-%d') AS \`deliveryDate\`,
             l.\`termDays\`,

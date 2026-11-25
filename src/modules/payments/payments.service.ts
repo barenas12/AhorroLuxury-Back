@@ -386,6 +386,9 @@ export class PaymentsService {
       const obsList: string[] = []
 
       for (const item of data.items) {
+        if (String(item.concept || '').trim() === 'Pago Cuota Préstamo') {
+          throw new Error('Los abonos a préstamos deben registrarse directamente desde el módulo de Préstamos y Respaldos.')
+        }
         const hasFineFlag = item.hasFine ? 1 : 0
         const amountVal = Number(item.amount || 0)
         const fineValue = item.hasFine ? Number(item.fineAmount || 0) : 0
