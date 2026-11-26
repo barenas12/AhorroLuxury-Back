@@ -1,8 +1,16 @@
-import { ResultSetHeader, RowDataPacket } from 'mysql2'
+import { PoolConnection, ResultSetHeader, RowDataPacket } from 'mysql2/promise'
 import bcrypt from 'bcrypt'
 import { dbPool } from '../../shared/config/database'
 import { calculateQuotaByFrequency, formatDateOnly } from '../../shared/utils/date.utils'
 import { ViewerScope } from '../../shared/utils/scope.utils'
+import { AppError } from '../../shared/errors/AppError'
+import { AuthUser } from '../../shared/middlewares/auth.middleware'
+import {
+  generateTemporaryPassword,
+  validatePasswordStrength
+} from '../../shared/utils/password.utils'
+
+const BCRYPT_ROUNDS = 12
 
 export interface CreateUserDTO {
   documentId: string
@@ -45,8 +53,10 @@ export class UsersService {
     }
   }
 
-  // Función auxiliar para normalizar y validar boletas (00 a 99)
-  private normalizeAndValidateTickets(rawTickets: string[] | string | undefined, raffleLabel: string): string[] {
+  private normalizeAndValidateTickets(
+    rawTickets: string[] | string | undefined,
+    raffleLabel: string
+  ): string[] {
     if (!rawTickets) return []
     const ticketsArray = this.parseTicketsSafe(rawTickets)
 
@@ -55,11 +65,17 @@ export class UsersService {
       if (item === '') continue
       const num = parseInt(item, 10)
       if (isNaN(num) || num < 0 || num > 99) {
-        throw new Error(`El número "${item}" en ${raffleLabel} es inválido. Debe estar entre 00 y 99.`)
+        throw new AppError(
+          `El número "${item}" en ${raffleLabel} es inválido. Debe estar entre 00 y 99.`,
+          400
+        )
       }
       const formatted = num.toString().padStart(2, '0')
       if (cleaned.includes(formatted)) {
-        throw new Error(`El número "${formatted}" está repetido para este usuario en ${raffleLabel}.`)
+        throw new AppError(
+          `El número "${formatted}" está repetido para este usuario en ${raffleLabel}.`,
+          400
+        )
       }
       cleaned.push(formatted)
     }
@@ -68,8 +84,9 @@ export class UsersService {
     return cleaned
   }
 
-  // Valida que los números no estén tomados por otro socio activo ni por compradores externos
+  // Valida disponibilidad dentro de la misma conexión/transacción para evitar condiciones de carrera
   private async checkTicketsAvailability(
+    executor: PoolConnection,
     tickets: string[],
     columnName: 'ticket' | 'ticket2',
     raffleName: string,
@@ -86,26 +103,28 @@ export class UsersService {
         AND \`${columnName}\` IS NOT NULL
         AND \`${columnName}\` != ''
     `
-    const params: any[] = []
+    const params: (string | number)[] = []
 
     if (excludePartnerId) {
       query += ` AND \`id\` != ?`
       params.push(excludePartnerId)
     }
 
-    const [rows] = await dbPool.execute<RowDataPacket[]>(query, params)
+    const [rows] = await executor.execute<RowDataPacket[]>(query, params)
 
     for (const row of rows) {
       const existingTickets = this.parseTicketsSafe(row.ticketsField)
       for (const t of tickets) {
         if (existingTickets.includes(t)) {
-          throw new Error(`La boleta "${t}" en ${raffleName} ya está asignada a ${row.name} ${row.lastName}.`)
+          throw new AppError(
+            `La boleta "${t}" en ${raffleName} ya está asignada a ${row.name} ${row.lastName}.`,
+            409
+          )
         }
       }
     }
 
-    // También validar contra boletas externas (compradas por afuera)
-    const [extRows] = await dbPool.execute<RowDataPacket[]>(
+    const [extRows] = await executor.execute<RowDataPacket[]>(
       `SELECT \`ticketNumber\`, \`fullName\` FROM \`raffle_external_tickets\` WHERE \`raffleType\` = ?`,
       [raffleType]
     )
@@ -113,12 +132,14 @@ export class UsersService {
     for (const ext of extRows) {
       const formattedExt = String(ext.ticketNumber).padStart(2, '0')
       if (tickets.includes(formattedExt)) {
-        throw new Error(`La boleta "${formattedExt}" en ${raffleName} ya está asignada a ${ext.fullName} (Externo).`)
+        throw new AppError(
+          `La boleta "${formattedExt}" en ${raffleName} ya está asignada a ${ext.fullName} (Externo).`,
+          409
+        )
       }
     }
   }
 
-  // 1. Obtener socios con ambos campos de boletas, fecha inicio y cuota calculada (filtrado por perfil)
   async getAllUsers(partnerStatusFilter?: number, scope?: ViewerScope): Promise<any[]> {
     let query = `
       SELECT 
@@ -155,7 +176,7 @@ export class UsersService {
       LEFT JOIN \`users\` coord ON p.\`coordinator\` = coord.\`id\`
     `
     const conditions: string[] = []
-    const params: any[] = []
+    const params: (string | number)[] = []
 
     if (partnerStatusFilter !== undefined && !isNaN(partnerStatusFilter)) {
       conditions.push(`COALESCE(p.\`status\`, 1) = ?`)
@@ -189,11 +210,13 @@ export class UsersService {
 
     return rows.map((row) => ({
       ...row,
-      quotaValue: calculateQuotaByFrequency(Number(row.savingsValue || 0), Number(row.frequency || 30))
+      quotaValue: calculateQuotaByFrequency(
+        Number(row.savingsValue || 0),
+        Number(row.frequency || 30)
+      )
     }))
   }
 
-  // 2. Coordinadores
   async getCoordinators(): Promise<RowDataPacket[]> {
     const query = `
       SELECT 
@@ -208,21 +231,23 @@ export class UsersService {
     return rows
   }
 
-  // 3. Crear usuario con ticket, ticket2 y savingsStartDate
-  async createUser(data: CreateUserDTO): Promise<void> {
+  async createUser(data: CreateUserDTO): Promise<{ temporaryPassword: string }> {
     const tickets1 = this.normalizeAndValidateTickets(data.ticket, 'Rifa 1')
     const tickets2 = this.normalizeAndValidateTickets(data.ticket2, 'Rifa 2')
-
-    await this.checkTicketsAvailability(tickets1, 'ticket', 'Rifa 1')
-    await this.checkTicketsAvailability(tickets2, 'ticket2', 'Rifa 2')
 
     const ticketJson1 = JSON.stringify(tickets1)
     const ticketJson2 = JSON.stringify(tickets2)
     const startDate = formatDateOnly(data.savingsStartDate)
 
+    const temporaryPassword = generateTemporaryPassword(12)
+    const hashedPassword = await bcrypt.hash(temporaryPassword, BCRYPT_ROUNDS)
+
     const connection = await dbPool.getConnection()
     try {
       await connection.beginTransaction()
+
+      await this.checkTicketsAvailability(connection, tickets1, 'ticket', 'Rifa 1')
+      await this.checkTicketsAvailability(connection, tickets2, 'ticket2', 'Rifa 2')
 
       const [existing] = await connection.execute<RowDataPacket[]>(
         `SELECT \`id\` FROM \`users\` WHERE \`user\` = ? LIMIT 1`,
@@ -230,7 +255,7 @@ export class UsersService {
       )
 
       if (existing.length > 0) {
-        throw new Error('El documento ya se encuentra registrado.')
+        throw new AppError('El documento ya se encuentra registrado.', 409)
       }
 
       const partnerQuery = `
@@ -252,10 +277,7 @@ export class UsersService {
         ticketJson2
       ])
 
-      const saltRounds = 10
-      const hashedPassword = await bcrypt.hash(data.documentId.trim(), saltRounds)
       const userStatus = data.canLogin ? 1 : 0
-
       const userQuery = `
         INSERT INTO \`users\` (
           \`name\`, \`lastName\`, \`profile\`, \`user\`, \`password\`, \`resetPassword\`, \`status\`
@@ -271,6 +293,7 @@ export class UsersService {
       ])
 
       await connection.commit()
+      return { temporaryPassword }
     } catch (error) {
       await connection.rollback()
       throw error
@@ -279,17 +302,13 @@ export class UsersService {
     }
   }
 
-  // 4. Actualizar usuario con ticket, ticket2 y savingsStartDate
   async updateUser(data: UpdateUserDTO): Promise<void> {
     if (!data.id || isNaN(Number(data.id))) {
-      throw new Error('ID de socio inválido.')
+      throw new AppError('ID de socio inválido.', 400)
     }
 
     const tickets1 = this.normalizeAndValidateTickets(data.ticket, 'Rifa 1')
     const tickets2 = this.normalizeAndValidateTickets(data.ticket2, 'Rifa 2')
-
-    await this.checkTicketsAvailability(tickets1, 'ticket', 'Rifa 1', data.id)
-    await this.checkTicketsAvailability(tickets2, 'ticket2', 'Rifa 2', data.id)
 
     const ticketJson1 = JSON.stringify(tickets1)
     const ticketJson2 = JSON.stringify(tickets2)
@@ -299,16 +318,30 @@ export class UsersService {
     try {
       await connection.beginTransaction()
 
-      const [currentPartner]: any = await connection.execute(
+      await this.checkTicketsAvailability(connection, tickets1, 'ticket', 'Rifa 1', data.id)
+      await this.checkTicketsAvailability(connection, tickets2, 'ticket2', 'Rifa 2', data.id)
+
+      const [currentPartner] = await connection.execute<RowDataPacket[]>(
         `SELECT \`documentId\` FROM \`partners\` WHERE \`id\` = ? LIMIT 1`,
         [data.id]
       )
 
       if (!currentPartner || currentPartner.length === 0) {
-        throw new Error('Socio no encontrado.')
+        throw new AppError('Socio no encontrado.', 404)
       }
 
-      const oldDoc = currentPartner[0].documentId
+      const oldDoc = String(currentPartner[0].documentId)
+      const newDoc = data.documentId.trim()
+
+      if (oldDoc !== newDoc) {
+        const [dup] = await connection.execute<RowDataPacket[]>(
+          `SELECT \`id\` FROM \`users\` WHERE \`user\` = ? LIMIT 1`,
+          [newDoc]
+        )
+        if (dup.length > 0) {
+          throw new AppError('El nuevo documento ya pertenece a otro usuario.', 409)
+        }
+      }
 
       const updatePartnerQuery = `
         UPDATE \`partners\`
@@ -317,7 +350,7 @@ export class UsersService {
         WHERE \`id\` = ?
       `
       await connection.execute(updatePartnerQuery, [
-        data.documentId.trim(),
+        newDoc,
         data.name.trim(),
         data.lastName.trim(),
         data.savingsValue,
@@ -340,7 +373,7 @@ export class UsersService {
         data.name.trim(),
         data.lastName.trim(),
         data.profile,
-        data.documentId.trim(),
+        newDoc,
         userLoginStatus,
         oldDoc
       ])
@@ -354,7 +387,6 @@ export class UsersService {
     }
   }
 
-  // 5. Consulta de Cuadrícula de Rifa (00 al 99 para Admin; solo boletas propias/a cargo para Coord y Socio)
   async getRaffleBoard(raffleType: '1' | '2', scope?: ViewerScope): Promise<any[]> {
     const raffleNum = raffleType === '2' ? 2 : 1
     const column = raffleNum === 2 ? 'ticket2' : 'ticket'
@@ -372,7 +404,7 @@ export class UsersService {
       LEFT JOIN \`users\` coord ON p.\`coordinator\` = coord.\`id\`
       WHERE COALESCE(p.\`status\`, 1) = 1 AND p.\`${column}\` IS NOT NULL AND p.\`${column}\` != ''
     `
-    const partnerParams: any[] = []
+    const partnerParams: (string | number)[] = []
 
     let externalQuery = `
       SELECT
@@ -386,7 +418,7 @@ export class UsersService {
       LEFT JOIN \`users\` coord ON e.\`coordinatorId\` = coord.\`id\`
       WHERE e.\`raffleType\` = ?
     `
-    const externalParams: any[] = [raffleNum]
+    const externalParams: (string | number)[] = [raffleNum]
     let includeExternals = true
 
     if (scope && scope.profile === 3) {
@@ -442,11 +474,12 @@ export class UsersService {
       return paidRows.some(
         (pay) =>
           Number(pay.externalTicketId) === externalTicketId ||
-          (pay.externalTicketId && String(pay.ticketNumber || '').padStart(2, '0') === ticketNum && Number(pay.raffleType) === raffleNum)
+          (pay.externalTicketId &&
+            String(pay.ticketNumber || '').padStart(2, '0') === ticketNum &&
+            Number(pay.raffleType) === raffleNum)
       )
     }
 
-    // Para Coordinador (2) y Socio (3): devolver ÚNICAMENTE las boletas asignadas a su alcance (Opción A)
     if (scope && (scope.profile === 2 || scope.profile === 3)) {
       const scopedList: any[] = []
 
@@ -505,7 +538,6 @@ export class UsersService {
       return scopedList
     }
 
-    // Mapa completo de 00 al 99 para Administrador (1)
     const board: any[] = []
     for (let i = 0; i <= 99; i++) {
       const numStr = i.toString().padStart(2, '0')
@@ -519,7 +551,6 @@ export class UsersService {
       })
     }
 
-    // Socios ahorradores
     for (const row of partnerRows) {
       const partnerTickets = this.parseTicketsSafe(row.tickets)
       for (const t of partnerTickets) {
@@ -543,7 +574,6 @@ export class UsersService {
       }
     }
 
-    // Compradores externos (por afuera)
     for (const ext of externalRows) {
       const index = parseInt(ext.ticketNumber, 10)
       if (index >= 0 && index <= 99 && board[index]) {
@@ -569,89 +599,164 @@ export class UsersService {
     return board
   }
 
-  // 6. Asignar boleta disponible desde la cuadrícula de rifas (a socio o comprador externo)
-  async assignRaffleTicket(raffleType: '1' | '2', data: AssignRaffleTicketDTO): Promise<{ ticketNumber: string; assigneeType: 'partner' | 'external'; id: number }> {
+  async assignRaffleTicket(
+    raffleType: '1' | '2',
+    data: AssignRaffleTicketDTO
+  ): Promise<{ ticketNumber: string; assigneeType: 'partner' | 'external'; id: number }> {
     const raffleNum = raffleType === '2' ? 2 : 1
     const columnName: 'ticket' | 'ticket2' = raffleNum === 2 ? 'ticket2' : 'ticket'
     const raffleLabel = raffleNum === 2 ? 'Rifa 2' : 'Rifa 1'
 
     const num = parseInt(String(data.ticketNumber || '').trim(), 10)
     if (isNaN(num) || num < 0 || num > 99) {
-      throw new Error(`El número "${data.ticketNumber}" es inválido. Debe estar entre 00 y 99.`)
+      throw new AppError(
+        `El número "${data.ticketNumber}" es inválido. Debe estar entre 00 y 99.`,
+        400
+      )
     }
     const formatted = num.toString().padStart(2, '0')
 
-    await this.checkTicketsAvailability([formatted], columnName, raffleLabel)
+    const connection = await dbPool.getConnection()
+    try {
+      await connection.beginTransaction()
 
-    if (data.assigneeType === 'partner') {
-      const partnerId = Number(data.partnerId)
-      if (!partnerId) {
-        throw new Error('Debes seleccionar un socio activo para asignar la boleta.')
+      await this.checkTicketsAvailability(connection, [formatted], columnName, raffleLabel)
+
+      if (data.assigneeType === 'partner') {
+        const partnerId = Number(data.partnerId)
+        if (!partnerId) {
+          throw new AppError('Debes seleccionar un socio activo para asignar la boleta.', 400)
+        }
+
+        const [rows] = await connection.execute<RowDataPacket[]>(
+          `SELECT \`id\`, \`${columnName}\` AS \`ticketsField\` FROM \`partners\` WHERE \`id\` = ? AND COALESCE(\`status\`, 1) = 1 LIMIT 1 FOR UPDATE`,
+          [partnerId]
+        )
+        if (rows.length === 0) {
+          throw new AppError('Socio no encontrado o inactivo.', 404)
+        }
+
+        const currentTickets = this.parseTicketsSafe(rows[0].ticketsField)
+        if (!currentTickets.includes(formatted)) {
+          currentTickets.push(formatted)
+          currentTickets.sort((a, b) => parseInt(a, 10) - parseInt(b, 10))
+        }
+
+        await connection.execute(
+          `UPDATE \`partners\` SET \`${columnName}\` = ? WHERE \`id\` = ?`,
+          [JSON.stringify(currentTickets), partnerId]
+        )
+
+        await connection.commit()
+        return { ticketNumber: formatted, assigneeType: 'partner', id: partnerId }
       }
 
-      const [rows] = await dbPool.execute<RowDataPacket[]>(
-        `SELECT \`id\`, \`${columnName}\` AS \`ticketsField\` FROM \`partners\` WHERE \`id\` = ? AND COALESCE(\`status\`, 1) = 1 LIMIT 1`,
-        [partnerId]
-      )
-      if (rows.length === 0) {
-        throw new Error('Socio no encontrado o inactivo.')
+      if (data.assigneeType === 'external') {
+        const fullName = String(data.fullName || '').trim()
+        const cellphone = String(data.cellphone || '').trim()
+        const coordinatorId = Number(data.coordinatorId)
+
+        if (!fullName || !cellphone || !coordinatorId) {
+          throw new AppError(
+            'Nombre, celular y coordinador responsable son obligatorios para boletas externas.',
+            400
+          )
+        }
+
+        const [result] = await connection.execute<ResultSetHeader>(
+          `INSERT INTO \`raffle_external_tickets\` (\`raffleType\`, \`ticketNumber\`, \`fullName\`, \`cellphone\`, \`coordinatorId\`)
+           VALUES (?, ?, ?, ?, ?)`,
+          [raffleNum, formatted, fullName, cellphone, coordinatorId]
+        )
+
+        await connection.commit()
+        return { ticketNumber: formatted, assigneeType: 'external', id: result.insertId }
       }
 
-      const currentTickets = this.parseTicketsSafe(rows[0].ticketsField)
-      if (!currentTickets.includes(formatted)) {
-        currentTickets.push(formatted)
-        currentTickets.sort((a, b) => parseInt(a, 10) - parseInt(b, 10))
-      }
-
-      await dbPool.execute(
-        `UPDATE \`partners\` SET \`${columnName}\` = ? WHERE \`id\` = ?`,
-        [JSON.stringify(currentTickets), partnerId]
-      )
-
-      return { ticketNumber: formatted, assigneeType: 'partner', id: partnerId }
+      throw new AppError('Tipo de asignación inválido.', 400)
+    } catch (error) {
+      await connection.rollback()
+      throw error
+    } finally {
+      connection.release()
     }
-
-    if (data.assigneeType === 'external') {
-      const fullName = String(data.fullName || '').trim()
-      const cellphone = String(data.cellphone || '').trim()
-      const coordinatorId = Number(data.coordinatorId)
-
-      if (!fullName || !cellphone || !coordinatorId) {
-        throw new Error('Nombre, celular y coordinador responsable son obligatorios para boletas externas.')
-      }
-
-      const [result] = await dbPool.execute<ResultSetHeader>(
-        `INSERT INTO \`raffle_external_tickets\` (\`raffleType\`, \`ticketNumber\`, \`fullName\`, \`cellphone\`, \`coordinatorId\`)
-         VALUES (?, ?, ?, ?, ?)`,
-        [raffleNum, formatted, fullName, cellphone, coordinatorId]
-      )
-
-      return { ticketNumber: formatted, assigneeType: 'external', id: result.insertId }
-    }
-
-    throw new Error('Tipo de asignación inválido.')
   }
 
-  // Métodos de estado y reset...
   async togglePartnerStatus(documentId: string, newStatus: number): Promise<void> {
-    const query = `UPDATE \`partners\` SET \`status\` = ? WHERE \`documentId\` = ?`
-    await dbPool.execute(query, [newStatus, documentId.trim()])
-  }
-
-  async resetPassword(documentId: string): Promise<void> {
-    const saltRounds = 10
-    const hashedPassword = await bcrypt.hash(documentId.trim(), saltRounds)
-    await dbPool.execute(
-      `UPDATE \`users\` SET \`password\` = ?, \`resetPassword\` = 1 WHERE \`user\` = ?`,
-      [hashedPassword, documentId.trim()]
+    const [result] = await dbPool.execute<ResultSetHeader>(
+      `UPDATE \`partners\` SET \`status\` = ? WHERE \`documentId\` = ?`,
+      [newStatus, documentId.trim()]
     )
+    if (result.affectedRows === 0) {
+      throw new AppError('Socio no encontrado.', 404)
+    }
   }
 
-  async updatePasswordFirstLogin(username: string, newPass: string): Promise<void> {
-    const hashedPassword = await bcrypt.hash(newPass, 10)
+  async resetPassword(documentId: string): Promise<{ temporaryPassword: string }> {
+    const cleanDoc = documentId.trim()
+    const temporaryPassword = generateTemporaryPassword(12)
+    const hashedPassword = await bcrypt.hash(temporaryPassword, BCRYPT_ROUNDS)
+
+    const [result] = await dbPool.execute<ResultSetHeader>(
+      `UPDATE \`users\` SET \`password\` = ?, \`resetPassword\` = 1 WHERE \`user\` = ?`,
+      [hashedPassword, cleanDoc]
+    )
+
+    if (result.affectedRows === 0) {
+      throw new AppError('Usuario no encontrado.', 404)
+    }
+
+    return { temporaryPassword }
+  }
+
+  async updatePasswordForAuthenticatedUser(
+    authUser: AuthUser,
+    newPassword: string,
+    currentPassword?: string
+  ): Promise<void> {
+    validatePasswordStrength(newPassword, {
+      documentId: authUser.user,
+      name: authUser.name,
+      lastName: authUser.lastName
+    })
+
+    const [rows] = await dbPool.execute<RowDataPacket[]>(
+      `SELECT \`id\`, \`password\`, \`resetPassword\` FROM \`users\` WHERE \`id\` = ? LIMIT 1`,
+      [authUser.id]
+    )
+
+    if (!rows || rows.length === 0) {
+      throw new AppError('Usuario no encontrado.', 404)
+    }
+
+    const record = rows[0]
+    const isFirstLoginReset = Number(record.resetPassword) === 1
+
+    // Si NO es cambio obligatorio de primer ingreso, exigir contraseña actual
+    if (!isFirstLoginReset) {
+      if (!currentPassword) {
+        throw new AppError('Debes ingresar tu contraseña actual para cambiarla.', 400)
+      }
+      const matches = record.password
+        ? await bcrypt.compare(currentPassword, String(record.password))
+        : false
+      if (!matches) {
+        throw new AppError('La contraseña actual es incorrecta.', 401)
+      }
+    }
+
+    // Evitar reutilizar exactamente la misma contraseña actual
+    if (record.password) {
+      const sameAsOld = await bcrypt.compare(newPassword, String(record.password))
+      if (sameAsOld) {
+        throw new AppError('La nueva contraseña debe ser diferente a la actual.', 400)
+      }
+    }
+
+    const hashedPassword = await bcrypt.hash(newPassword, BCRYPT_ROUNDS)
     await dbPool.execute(
-      `UPDATE \`users\` SET \`password\` = ?, \`resetPassword\` = 0 WHERE \`user\` = ?`,
-      [hashedPassword, username.trim()]
+      `UPDATE \`users\` SET \`password\` = ?, \`resetPassword\` = 0 WHERE \`id\` = ?`,
+      [hashedPassword, authUser.id]
     )
   }
 }

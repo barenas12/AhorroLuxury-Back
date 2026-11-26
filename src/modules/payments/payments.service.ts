@@ -2,6 +2,7 @@ import { ResultSetHeader, RowDataPacket } from 'mysql2'
 import { dbPool } from '../../shared/config/database'
 import { calculateQuotaByFrequency, formatDateOnly } from '../../shared/utils/date.utils'
 import { ViewerScope } from '../../shared/utils/scope.utils'
+import { AppError } from '../../shared/errors/AppError'
 
 export interface PaymentRowItemDTO {
   concept: string
@@ -140,6 +141,13 @@ export class PaymentsService {
     receiptsQuery += ` ORDER BY r.\`id\` DESC `
     const [receipts] = await dbPool.execute<RowDataPacket[]>(receiptsQuery, params)
 
+    if (receipts.length === 0) {
+      return []
+    }
+
+    const receiptIds = receipts.map((r) => Number(r.id))
+    const receiptPlaceholders = receiptIds.map(() => '?').join(',')
+
     const itemsQuery = `
       SELECT
         pay.\`id\`,
@@ -158,10 +166,10 @@ export class PaymentsService {
         DATE_FORMAT(pay.\`paymentDate\`, '%Y-%m-%d') AS \`paymentDate\`,
         pay.\`observations\`
       FROM \`payments\` pay
-      WHERE pay.\`receiptId\` IS NOT NULL
+      WHERE pay.\`receiptId\` IN (${receiptPlaceholders})
       ORDER BY pay.\`id\` ASC
     `
-    const [allItems] = await dbPool.execute<RowDataPacket[]>(itemsQuery)
+    const [allItems] = await dbPool.execute<RowDataPacket[]>(itemsQuery, receiptIds)
 
     const itemsByReceipt = new Map<number, any[]>()
     for (const item of allItems) {
@@ -373,7 +381,7 @@ export class PaymentsService {
   // 3. Crear pagos + registro único en payment_receipts + soporte "Al día" y externos
   async createMultiplePayments(data: CreateMultiplePaymentsDTO): Promise<{ receiptId: number; paymentIds: number[] }> {
     if (!data.items || data.items.length === 0) {
-      throw new Error('Debe ingresar al menos un concepto de pago.')
+      throw new AppError('Debe ingresar al menos un concepto de pago.', 400)
     }
 
     const connection = await dbPool.getConnection()
@@ -387,7 +395,7 @@ export class PaymentsService {
 
       for (const item of data.items) {
         if (String(item.concept || '').trim() === 'Pago Cuota Préstamo') {
-          throw new Error('Los abonos a préstamos deben registrarse directamente desde el módulo de Préstamos y Respaldos.')
+          throw new AppError('Los abonos a préstamos deben registrarse directamente desde el módulo de Préstamos y Respaldos.', 400)
         }
         const hasFineFlag = item.hasFine ? 1 : 0
         const amountVal = Number(item.amount || 0)

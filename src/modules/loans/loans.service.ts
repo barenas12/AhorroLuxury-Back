@@ -9,6 +9,10 @@ import {
   parseDateOnlyUTC
 } from '../../shared/utils/date.utils'
 import { ViewerScope } from '../../shared/utils/scope.utils'
+import { AppError } from '../../shared/errors/AppError'
+import { EgressesService } from '../egresses/egresses.service'
+
+const egressesService = new EgressesService()
 
 export type LoanInterestMode = 'percentage' | 'fixed'
 
@@ -223,11 +227,43 @@ export class LoansService {
       WHERE l.\`id\` = ?
     `
     const [rows] = await dbPool.execute<RowDataPacket[]>(query, [loanId, loanId])
-    if (rows.length === 0) throw new Error('Préstamo no encontrado.')
+    if (rows.length === 0) throw new AppError('Préstamo no encontrado.', 404)
     return this.computeLoanMetrics(rows[0])
   }
 
-  async getLoanReceipts(loanId: number): Promise<any[]> {
+  async getLoanReceipts(loanId: number, scope?: ViewerScope): Promise<any[]> {
+    // Validación contra IDOR: verificar existencia y pertenencia del préstamo al alcance del usuario
+    const [loanOwnershipRows] = await dbPool.execute<RowDataPacket[]>(
+      `
+        SELECT l.\`id\`, l.\`partnerId\`, p.\`coordinator\`
+        FROM \`loans\` l
+        INNER JOIN \`partners\` p ON l.\`partnerId\` = p.\`id\`
+        WHERE l.\`id\` = ?
+        LIMIT 1
+      `,
+      [loanId]
+    )
+
+    if (loanOwnershipRows.length === 0) {
+      throw new AppError('Préstamo no encontrado.', 404)
+    }
+
+    if (scope && scope.profile !== 1) {
+      const ownerPartnerId = Number(loanOwnershipRows[0].partnerId)
+      const ownerCoordinatorId = Number(loanOwnershipRows[0].coordinator)
+
+      if (scope.profile === 3) {
+        if (!scope.ownPartnerId || ownerPartnerId !== scope.ownPartnerId) {
+          throw new AppError('No tienes permisos para consultar los recibos de este préstamo.', 403)
+        }
+      } else if (scope.profile === 2) {
+        const isOwn = Boolean(scope.ownPartnerId && ownerPartnerId === scope.ownPartnerId)
+        const isAssignedPartner = Boolean(scope.userId && ownerCoordinatorId === scope.userId)
+        if (!isOwn && !isAssignedPartner) {
+          throw new AppError('No tienes permisos para consultar los recibos de este préstamo.', 403)
+        }
+      }
+    }
     const [receipts] = await dbPool.execute<RowDataPacket[]>(
       `
         SELECT
@@ -311,30 +347,81 @@ export class LoansService {
         : 0
     }
 
-    const query = `
-      INSERT INTO \`loans\` (
-        \`partnerId\`, \`initialCapital\`, \`interestRate\`, \`interestMode\`, \`fixedInterestAmount\`,
-        \`interestAdjustment\`, \`deliveryMethod\`, \`guarantee\`, \`deliveryDate\`, \`termDays\`,
-        \`dueDate\`, \`installments\`, \`observations\`, \`registeredBy\`
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `
-    const [result] = await dbPool.execute<ResultSetHeader>(query, [
-      data.partnerId,
-      capital,
-      effectiveRate,
-      interestMode,
-      fixedInterestAmount,
-      interestAdjustment,
-      data.deliveryMethod,
-      data.guarantee,
-      data.deliveryDate,
-      data.termDays,
-      data.dueDate || null,
-      data.installments ? Number(data.installments) : 1,
-      data.observations || '',
-      data.registeredBy
-    ])
-    return result.insertId
+    const connection = await dbPool.getConnection()
+    try {
+      await connection.beginTransaction()
+
+      // 1. Verificar socio activo
+      const [partnerRows] = await connection.execute<RowDataPacket[]>(
+        `SELECT \`id\`, \`documentId\`, CONCAT_WS(' ', \`name\`, \`lastName\`) AS \`fullName\`
+         FROM \`partners\`
+         WHERE \`id\` = ? AND COALESCE(\`status\`, 1) = 1
+         LIMIT 1`,
+        [data.partnerId]
+      )
+      if (partnerRows.length === 0) {
+        throw new AppError('Socio no encontrado o inactivo.', 404)
+      }
+      const partner = partnerRows[0]
+
+      // 2. Verificar fondos disponibles en el medio de entrega dentro de la misma transacción
+      await egressesService.checkAvailableFundsOnConnection(
+        connection,
+        data.deliveryMethod,
+        capital
+      )
+
+      // 3. Registrar el egreso atómicamente junto con el préstamo
+      await connection.execute(
+        `
+          INSERT INTO \`egresses\` (
+            \`concept\`, \`amount\`, \`paymentMethod\`, \`recipient\`, \`paymentDate\`, \`observations\`, \`registeredBy\`
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        `,
+        [
+          `Préstamo Entregado - C.C. ${partner.documentId}`,
+          capital,
+          data.deliveryMethod,
+          String(partner.fullName || ''),
+          data.deliveryDate,
+          `Garantía: ${data.guarantee}`,
+          data.registeredBy
+        ]
+      )
+
+      // 4. Registrar el contrato del préstamo
+      const query = `
+        INSERT INTO \`loans\` (
+          \`partnerId\`, \`initialCapital\`, \`interestRate\`, \`interestMode\`, \`fixedInterestAmount\`,
+          \`interestAdjustment\`, \`deliveryMethod\`, \`guarantee\`, \`deliveryDate\`, \`termDays\`,
+          \`dueDate\`, \`installments\`, \`observations\`, \`registeredBy\`
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `
+      const [result] = await connection.execute<ResultSetHeader>(query, [
+        data.partnerId,
+        capital,
+        effectiveRate,
+        interestMode,
+        fixedInterestAmount,
+        interestAdjustment,
+        data.deliveryMethod,
+        data.guarantee,
+        data.deliveryDate,
+        data.termDays,
+        data.dueDate || null,
+        data.installments ? Number(data.installments) : 1,
+        data.observations || '',
+        data.registeredBy
+      ])
+
+      await connection.commit()
+      return result.insertId
+    } catch (error) {
+      await connection.rollback()
+      throw error
+    } finally {
+      connection.release()
+    }
   }
 
   async updateLoanInterest(loanId: number, data: UpdateLoanInterestDTO): Promise<any> {
@@ -353,7 +440,7 @@ export class LoansService {
         data.fixedInterestAmount !== undefined && data.fixedInterestAmount !== null
           ? Number(data.fixedInterestAmount)
           : current.interestPerCycle
-      if (isNaN(rawFixed) || rawFixed < 0) throw new Error('El valor de interés fijo no puede ser negativo.')
+      if (isNaN(rawFixed) || rawFixed < 0) throw new AppError('El valor de interés fijo no puede ser negativo.', 400)
       nextFixedAmount = Math.round(rawFixed)
       nextRate =
         current.initialCapital > 0
@@ -362,7 +449,7 @@ export class LoansService {
     } else {
       nextFixedAmount = null
       if (data.interestRate !== undefined && !isNaN(Number(data.interestRate))) {
-        if (Number(data.interestRate) < 0) throw new Error('La tasa de interés no puede ser negativa.')
+        if (Number(data.interestRate) < 0) throw new AppError('La tasa de interés no puede ser negativa.', 400)
         nextRate = Number(data.interestRate)
       }
     }
@@ -425,11 +512,19 @@ export class LoansService {
         `,
         [loanId, loanId]
       )
-      if (loanRows.length === 0) throw new Error('Préstamo no encontrado.')
+      if (loanRows.length === 0) throw new AppError('Préstamo no encontrado.', 404)
       const loanRow = loanRows[0]
+      if (loanRow.status === 'Pagado' || loanRow.status === 'Anulado') {
+        throw new AppError(`El préstamo ya se encuentra en estado "${loanRow.status}".`, 400)
+      }
       const partnerId = Number(loanRow.partnerId)
       const paymentDate = formatDateOnly(data.paymentDate) || new Date().toISOString().substring(0, 10)
       const metricsBefore = this.computeLoanMetrics(loanRow, paymentDate)
+
+      const capitalPaidNow = Number(data.capitalEfectivo || 0) + Number(data.capitalTransferencia || 0)
+      if (capitalPaidNow > metricsBefore.remainingCapital) {
+        throw new AppError('El abono a capital no puede superar el saldo pendiente del préstamo.', 400)
+      }
 
       const insertPaymentQuery = `
         INSERT INTO \`payments\` (

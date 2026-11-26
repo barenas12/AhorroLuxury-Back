@@ -17,13 +17,15 @@ export interface UserRecord extends RowDataPacket {
 }
 
 export class LoginService {
-  async getUserByUsername(username: string): Promise<UserRecord> {
-    // Protección contra undefined / null / no string
+  async getUserByUsername(username: string): Promise<UserRecord | null> {
     if (!username || typeof username !== 'string') {
-      throw new Error('usuario no registrado')
+      return null
     }
 
     const cleanUsername = String(username).trim()
+    if (!cleanUsername) {
+      return null
+    }
 
     const query = `
       SELECT 
@@ -48,7 +50,7 @@ export class LoginService {
     const [rows] = await dbPool.execute<UserRecord[]>(query, [cleanUsername])
 
     if (!rows || rows.length === 0) {
-      throw new Error('usuario no registrado')
+      return null
     }
 
     return rows[0]

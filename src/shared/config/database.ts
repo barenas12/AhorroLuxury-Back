@@ -1,14 +1,21 @@
 import mysql, { Pool } from 'mysql2/promise'
-import dotenv from 'dotenv'
 import fs from 'fs'
 
-dotenv.config()
+const isProduction = process.env.NODE_ENV === 'production'
+
+const dbHost = process.env.DB_HOST?.trim() || (isProduction ? '' : 'localhost')
+const dbUser = process.env.DB_USER?.trim() || (isProduction ? '' : 'root')
+const dbPassword = process.env.DB_PASSWORD ?? (isProduction ? '' : '')
+const dbName = process.env.DB_NAME?.trim() || (isProduction ? '' : 'luxury')
+
+if (isProduction && (!dbHost || !dbUser || !dbName)) {
+  throw new Error(
+    'Configuración de base de datos incompleta: DB_HOST, DB_USER y DB_NAME son obligatorios en producción.'
+  )
+}
 
 // 1. Configuración del Pool de conexiones (soporta MySQL local y TiDB Cloud con TLS)
-const isLocal =
-  !process.env.DB_HOST ||
-  process.env.DB_HOST === 'localhost' ||
-  process.env.DB_HOST === '127.0.0.1'
+const isLocal = !dbHost || dbHost === 'localhost' || dbHost === '127.0.0.1'
 
 const buildSslConfig = () => {
   if (isLocal) return undefined
@@ -26,16 +33,17 @@ const buildSslConfig = () => {
 const sslConfig = buildSslConfig()
 
 export const dbPool: Pool = mysql.createPool({
-  host: process.env.DB_HOST || 'localhost',
+  host: dbHost,
   port: Number(process.env.DB_PORT) || 3306,
-  user: process.env.DB_USER || 'root',
-  password: process.env.DB_PASSWORD || '',
-  database: process.env.DB_NAME || 'luxury',
+  user: dbUser,
+  password: dbPassword,
+  database: dbName,
   waitForConnections: true,
   connectionLimit: 10,        // Máximo 10 conexiones simultáneas
   maxIdle: 10,                // Conexiones inactivas permitidas
   idleTimeout: 60000,         // Tiempo antes de cerrar conexión inactiva (ms)
-  queueLimit: 0,              // Sin límite de peticiones en cola
+  queueLimit: 50,             // Límite de peticiones en cola para evitar agotamiento de memoria
+  connectTimeout: 10000,      // Timeout de conexión (ms)
   enableKeepAlive: true,
   keepAliveInitialDelay: 0,
   ...(sslConfig ? { ssl: sslConfig } : {})

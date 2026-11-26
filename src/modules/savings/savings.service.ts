@@ -89,7 +89,13 @@ export class SavingsService {
 
     const [partners] = await dbPool.execute<RowDataPacket[]>(partnersQuery, params)
 
-    // 2. Obtener pagos de socios
+    if (partners.length === 0) {
+      return []
+    }
+
+    // 2. Obtener únicamente pagos pertenecientes a los socios dentro del alcance
+    const partnerIds = partners.map((p) => Number(p.id))
+    const idPlaceholders = partnerIds.map(() => '?').join(',')
     const paymentsQuery = `
       SELECT 
         \`partnerId\`,
@@ -99,9 +105,9 @@ export class SavingsService {
         \`raffleType\`,
         DATE_FORMAT(\`paymentDate\`, '%Y-%m-%d') AS \`paymentDate\`
       FROM \`payments\`
-      WHERE \`partnerId\` IS NOT NULL
+      WHERE \`partnerId\` IN (${idPlaceholders})
     `
-    const [payments] = await dbPool.execute<RowDataPacket[]>(paymentsQuery)
+    const [payments] = await dbPool.execute<RowDataPacket[]>(paymentsQuery, partnerIds)
 
     const parseTicketsArray = (raw: string | undefined): string[] => {
       if (!raw) return []
